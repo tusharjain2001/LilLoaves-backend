@@ -1,0 +1,24 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+id_*
+!*.pub
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea
+
+# Logs
+*.log
+logs/
+
+# Dependencies / build
+node_modules/
+vendor/
+dist/
