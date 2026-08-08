@@ -79,30 +79,26 @@ function ll_client_id(WP_REST_Request $request) {
 }
 
 /**
- * Storefront origin allowlist. `/quote` is public and, via ll_boot_cart(),
- * resumes whatever cart a forwarded session cookie points at, then empties
- * it. That's the intended shape for the real caller (a server-to-server
- * call from the Vercel proxy, which forwards no cookie), but nothing
- * stopped a same-origin caller from silently wiping a real customer's
- * in-progress cart, coupon and shipping choice. Same reasoning as Task 7's
- * handoff-endpoint check; the allowlist lives in an option so that check
- * can read the same list.
+ * `/quote` is public and, via ll_boot_cart(), resumes whatever cart a
+ * forwarded session cookie points at, then empties it. Origin/Referer
+ * can't gate that here: the real caller is a server-to-server call from
+ * the Vercel proxy (api/store.js), which is not a browser and sends
+ * neither header — and both are trivially forgeable by a non-browser
+ * client anyway, so checking them buys nothing on a machine-to-machine
+ * endpoint. A shared secret is a real guarantee instead of a spoofable
+ * one, and it's strictly stronger: it makes /quote unreachable from a
+ * browser at all, which closes the session-wipe risk at the root rather
+ * than mitigating it.
  *
- * Fails closed: no Origin and no Referer is untrusted, not "presumably a
- * trusted server-to-server call."
+ * Task 7's handoff endpoint is a genuine browser form POST, so Origin is
+ * the right check *there* — do not "harmonise" the two.
+ *
+ * hash_equals(), not ===, so a wrong guess can't be timed byte-by-byte.
  */
-function ll_origin_allowed(WP_REST_Request $request) {
-    $source = $request->get_header('origin') ?: $request->get_header('referer');
-    if (!$source) return false;
-
-    $scheme = wp_parse_url($source, PHP_URL_SCHEME);
-    $host   = wp_parse_url($source, PHP_URL_HOST);
-    if (!$scheme || !$host) return false;
-    $port   = wp_parse_url($source, PHP_URL_PORT);
-    $origin = $scheme . '://' . $host . ($port ? ':' . $port : '');
-
-    $allowed = array_filter(array_map('trim', explode(',', (string) get_option('ll_allowed_origins', ''))));
-    return in_array($origin, $allowed, true);
+function ll_secret_ok(WP_REST_Request $request) {
+    $secret = (string) get_option('ll_bridge_secret', '');
+    $given  = (string) $request->get_header('x_ll_secret');
+    return $secret !== '' && $given !== '' && hash_equals($secret, $given);
 }
 
 /**
@@ -113,8 +109,8 @@ function ll_quote(WP_REST_Request $request) {
         return new WP_REST_Response(['errors' => ['Store unavailable']], 503);
     }
 
-    if (!ll_origin_allowed($request)) {
-        return new WP_REST_Response(['errors' => ['Origin not allowed']], 403);
+    if (!ll_secret_ok($request)) {
+        return new WP_REST_Response(['errors' => ['Forbidden']], 403);
     }
 
     $client = ll_client_id($request);

@@ -61,25 +61,40 @@ the storefront to confirm it recovered.
 
 ## `POST /wp-json/lilloaves/v1/quote`
 
-Public endpoint, no auth — like the WooCommerce Store API, it creates no
-order, it only prices a hypothetical cart. Origin-checked and rate-limited
-(see below).
+Not actually public despite the permissive `permission_callback` — it's
+gated by a shared secret (see below) and rate-limited (see further down).
+Like the WooCommerce Store API, it creates no order, it only prices a
+hypothetical cart.
 
-**Origin/Referer check.** `ll_boot_cart()` resumes whatever cart a forwarded
-session cookie points at (WooCommerce session cookies aren't scoped to this
-endpoint), and `/quote` empties that cart twice. The intended caller — the
-Vercel proxy — forwards no cookie, so this is normally moot, but nothing
-should let an arbitrary same-origin caller silently wipe a real customer's
-in-progress cart. `/quote` checks the `Origin` header (falling back to
-`Referer`) against the comma-separated allowlist in the `ll_allowed_origins`
-option, and **fails closed**: no `Origin` and no `Referer` at all is
-rejected with `403`, same as a mismatched one. Set the option with:
+**Shared secret, not Origin/Referer.** `ll_boot_cart()` resumes whatever
+cart a forwarded session cookie points at, and `/quote` empties that cart
+twice — so something has to gate who can call it. Origin/Referer doesn't
+work here: the real caller is a **server-to-server** call from the Vercel
+proxy (`api/store.js` in the frontend repo), which is not a browser and
+sends neither header. It's also the wrong tool in principle — both headers
+are trivially forgeable by any non-browser client, so checking them on a
+machine-to-machine endpoint proves nothing. (An earlier revision of this
+endpoint used an Origin allowlist; it's gone, replaced entirely by the
+secret below — don't bring both back, two half-mechanisms are worse than
+one that works.)
+
+Every request must carry header `X-LL-Secret` matching the `ll_bridge_secret`
+WordPress option, compared with `hash_equals()` (not `===`, so a wrong
+guess can't be timed byte-by-byte). No match, or the header absent →
+`403`. The secret lives in exactly two places: this WP option, and a
+Vercel environment variable — **never in either git repo.** Rotate it with:
 
 ```bash
-ssh lilloaves-wp 'wp option update ll_allowed_origins "https://your-storefront-domain"'
+ssh lilloaves-wp "wp eval 'update_option(\"ll_bridge_secret\", bin2hex(random_bytes(32)), false);'"
 ```
+then update the Vercel env var to match.
 
-Task 7's handoff endpoint reads the same option.
+**This is deliberately different from Task 7's handoff endpoint**, which
+checks Origin. That's correct there because the handoff *is* a genuine
+browser form POST — the browser sends a real, unforgeable-by-a-third-party
+Origin header, so checking it means something. `/quote` has no such
+signal to check, hence the secret instead. Do not "harmonise" the two
+mechanisms onto either endpoint.
 
 **Request body:**
 
