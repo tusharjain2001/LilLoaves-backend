@@ -79,11 +79,42 @@ function ll_client_id(WP_REST_Request $request) {
 }
 
 /**
+ * Storefront origin allowlist. `/quote` is public and, via ll_boot_cart(),
+ * resumes whatever cart a forwarded session cookie points at, then empties
+ * it. That's the intended shape for the real caller (a server-to-server
+ * call from the Vercel proxy, which forwards no cookie), but nothing
+ * stopped a same-origin caller from silently wiping a real customer's
+ * in-progress cart, coupon and shipping choice. Same reasoning as Task 7's
+ * handoff-endpoint check; the allowlist lives in an option so that check
+ * can read the same list.
+ *
+ * Fails closed: no Origin and no Referer is untrusted, not "presumably a
+ * trusted server-to-server call."
+ */
+function ll_origin_allowed(WP_REST_Request $request) {
+    $source = $request->get_header('origin') ?: $request->get_header('referer');
+    if (!$source) return false;
+
+    $scheme = wp_parse_url($source, PHP_URL_SCHEME);
+    $host   = wp_parse_url($source, PHP_URL_HOST);
+    if (!$scheme || !$host) return false;
+    $port   = wp_parse_url($source, PHP_URL_PORT);
+    $origin = $scheme . '://' . $host . ($port ? ':' . $port : '');
+
+    $allowed = array_filter(array_map('trim', explode(',', (string) get_option('ll_allowed_origins', ''))));
+    return in_array($origin, $allowed, true);
+}
+
+/**
  * Prices a prospective cart without creating an order.
  */
 function ll_quote(WP_REST_Request $request) {
     if (!ll_wc_ready()) {
         return new WP_REST_Response(['errors' => ['Store unavailable']], 503);
+    }
+
+    if (!ll_origin_allowed($request)) {
+        return new WP_REST_Response(['errors' => ['Origin not allowed']], 403);
     }
 
     $client = ll_client_id($request);
@@ -173,6 +204,15 @@ function ll_quote(WP_REST_Request $request) {
     ];
 
     WC()->cart->empty_cart();
+
+    // empty_cart() doesn't stop WooCommerce from persisting a session row on
+    // shutdown for this guest — calculate_totals() above sets the "has
+    // cookie" flag regardless of whether one was actually sent, which makes
+    // WC think there's a session worth saving. destroy_session() clears that
+    // flag (and drops anything already attached to this customer id) so no
+    // row survives past this request. /quote prices a hypothetical cart; it
+    // must not create state for anyone to come back to.
+    WC()->session->destroy_session();
 
     return new WP_REST_Response($response, 200);
 }

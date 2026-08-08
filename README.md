@@ -10,7 +10,10 @@ must-use plugin that prices carts.
   `POST /wp-json/lilloaves/v1/quote`, which prices a cart (items, shipping,
   coupon) using WooCommerce's own product/shipping/coupon data, so a
   tampered client request can never change what a customer is charged. It
-  creates no order and touches no persistent state beyond a throttle counter.
+  creates no order, and explicitly destroys the WooCommerce session it used
+  before returning, so no session row survives a quote either (see below —
+  `calculate_totals()` will otherwise persist one regardless of whether a
+  cookie was ever sent).
 - `.env` (gitignored) — WordPress.com site URL, SSH/SFTP access, WooCommerce
   object IDs. Copy `.env.example` to `.env` and fill in locally; never commit
   real values.
@@ -58,8 +61,25 @@ the storefront to confirm it recovered.
 
 ## `POST /wp-json/lilloaves/v1/quote`
 
-Public endpoint, no auth — like the WooCommerce Store API, it creates
-nothing, it only prices a hypothetical cart. Rate-limited (see below).
+Public endpoint, no auth — like the WooCommerce Store API, it creates no
+order, it only prices a hypothetical cart. Origin-checked and rate-limited
+(see below).
+
+**Origin/Referer check.** `ll_boot_cart()` resumes whatever cart a forwarded
+session cookie points at (WooCommerce session cookies aren't scoped to this
+endpoint), and `/quote` empties that cart twice. The intended caller — the
+Vercel proxy — forwards no cookie, so this is normally moot, but nothing
+should let an arbitrary same-origin caller silently wipe a real customer's
+in-progress cart. `/quote` checks the `Origin` header (falling back to
+`Referer`) against the comma-separated allowlist in the `ll_allowed_origins`
+option, and **fails closed**: no `Origin` and no `Referer` at all is
+rejected with `403`, same as a mismatched one. Set the option with:
+
+```bash
+ssh lilloaves-wp 'wp option update ll_allowed_origins "https://your-storefront-domain"'
+```
+
+Task 7's handoff endpoint reads the same option.
 
 **Request body:**
 
