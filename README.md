@@ -112,7 +112,12 @@ mechanisms onto either endpoint.
   error.
 - `fulfilment` — `"pickup"` or `"delivery"`; anything else is treated as
   `"delivery"`.
-- `postcode` — required for `"delivery"`; ignored (blanked) for `"pickup"`.
+- `postcode` — used for `"delivery"`; ignored (blanked) for `"pickup"`. Not
+  required: an empty or missing postcode on a delivery quote is the cart's
+  normal starting state before the customer has typed one in, and returns
+  `delivery: 0` with **no error** — it is not the same as "outside our
+  area". Only a non-empty postcode that matches no shipping zone produces
+  the out-of-area error.
 - `coupon` — optional coupon code.
 
 **Response body** — all amounts are integers in **minor units** (cents):
@@ -143,9 +148,16 @@ mechanisms onto either endpoint.
 - `lines[].total` is pre-discount (matches `subtotal`'s basis) — the
   discount is shown on its own row, never baked into line items. So
   `Σ lines[].total === subtotal` always holds, coupon or not.
-- `delivery` is 0 for pickup, the matched flat-rate cost for an in-zone
-  delivery postcode, and — critically — an **error**, never a silent 0, for
-  a postcode outside the delivery zone.
+- `delivery` is 0 in three different situations, only one of which is an
+  error: pickup (always 0, no error); a delivery quote with no postcode
+  entered yet (0, no error — the cart's normal starting state); and a
+  delivery postcode outside the zone (0, **with** the out-of-area error —
+  never a silent free shipping). Only a matched, in-zone postcode returns a
+  non-zero `delivery`. The response carries no separate flag for "no
+  estimate yet" vs "quoted at zero" — the client already has the postcode
+  it sent, so it can tell these apart from its own request state without
+  a round trip; add one only if that stops being true (e.g. a quote is
+  ever rendered somewhere that didn't originate the request).
 - `currency` is shaped exactly like the WooCommerce Store API's currency
   object, so the client can pass it straight to its existing `formatPrice`.
 - `errors` is a flat array of user-facing strings (never a fatal or a

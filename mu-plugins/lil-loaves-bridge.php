@@ -245,6 +245,17 @@ function ll_apply_fulfilment($fulfilment, $postcode) {
     WC()->customer->set_shipping_postcode($fulfilment === 'delivery' ? $postcode : '');
     WC()->customer->set_billing_postcode($fulfilment === 'delivery' ? $postcode : '');
 
+    // A delivery quote with no postcode yet is the cart's normal starting
+    // state — the customer hasn't typed one in. That is not "outside our
+    // area"; it is "no estimate yet", so skip the zone match and never
+    // produce the out-of-area error for it. A non-empty postcode that
+    // matches no zone still falls through to the error below, unchanged.
+    if ($fulfilment === 'delivery' && $postcode === '') {
+        WC()->cart->calculate_shipping();
+        WC()->session->set('chosen_shipping_methods', []);
+        return $errors;
+    }
+
     WC()->cart->calculate_shipping();               // pass one: populate
 
     $wanted = $fulfilment === 'pickup' ? 'local_pickup' : 'flat_rate';
