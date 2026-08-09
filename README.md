@@ -200,13 +200,19 @@ them on a real order prefilled with an attacker's shipping address (CSRF).
 
 **Every rejection redirects to `{storefront}/cart?error=<code>`, never
 `wp_die()`** — a bakery customer must never see a raw WordPress error page.
-The redirect target always comes from the **stored allowlist option**
-(specifically its first entry), never from the incoming Origin/Referer, or
-the failure path becomes an open redirect. Because that target is a
-different domain than this site, it's also registered via the
-`allowed_redirect_hosts` filter — `wp_safe_redirect()` silently falls back
-to `admin_url()` for any host not on that list, which would otherwise turn
-every error case into a confusing redirect to `/wp-admin/`.
+The redirect target always comes from the **stored allowlist option**, never
+from the raw incoming Origin/Referer *value*, or the failure path becomes an
+open redirect. Once the Origin/Referer check itself has passed, later
+rejections redirect back to whichever allowlist entry actually matched (so a
+local dev rejection returns to `localhost`, not production) — still safe,
+because that's a selection among our own configured origins, never the
+header's raw value. The two rejections that can happen *before* a match
+exists (WooCommerce unavailable; the Origin/Referer check's own failure)
+fall back to the allowlist's first entry. Because the target is a different
+domain than this site, it's also registered via the `allowed_redirect_hosts`
+filter — `wp_safe_redirect()` silently falls back to `admin_url()` for any
+host not on that list, which would otherwise turn every error case into a
+confusing redirect to `/wp-admin/`.
 
 Error codes: `origin`, `throttled`, `unavailable` (store not ready, spent
 idempotency token, or a cart that ended up empty), `coupon`, `out_of_area`
@@ -214,13 +220,39 @@ idempotency token, or a cart that ended up empty), `coupon`, `out_of_area`
 is final, unlike `/quote`'s live-typing UX where a blank postcode just means
 "no estimate yet"), `below_minimum`.
 
-**Idempotency.** The client generates a `token` once per cart *state*
-(items, fulfilment, postcode, coupon), not once per click — see Task 9 in
-the frontend repo. The token is marked seen atomically, before any work
-happens: the first submission of a token succeeds, every later one with the
-same token is rejected outright. A submission that crashes partway leaves
-the token spent, so a retry lands on an empty cart rather than risking a
-double charge — a confusing empty cart beats billing someone twice.
+**What actually prevents a doubled order — `empty_cart()`, not the
+idempotency token.** The handler always empties the real WooCommerce session
+cart before adding anything back. Verified live, not just reasoned about: two
+genuinely concurrent PHP processes (not a sequential replay) racing
+`empty_cart()` + `add_to_cart()` against the *same* WooCommerce session, with
+the *same* items, converge on the correct single quantity every time —
+tested both with the same idempotency token and, separately, with two
+different tokens (i.e. with the token guard effectively absent). Neither
+raced to a doubled cart. Root cause: `WC_Session_Handler` persists the whole
+session as one atomic blob on save, not as incremental per-item writes. Two
+racing requests each compute the same target cart in their own process
+memory (empty, then add the same items) and whichever save lands last simply
+overwrites with that same state — there's no shared mutable structure for
+two adds to interleave into and inflate a quantity. This holds for the
+double-click and back-then-resubmit cases the guard was built for, because
+both requests always carry the *same* item list.
+
+**Idempotency (`token`) is a real but secondary guard, kept as cheap defence
+in depth.** The client generates it once per cart *state* (items,
+fulfilment, postcode, coupon), not once per click — see Task 9 in the
+frontend repo. It's marked seen atomically, before any work happens: the
+first submission of a token succeeds, every later one with the same token is
+rejected outright, before touching the cart at all. What it actually buys,
+given `empty_cart()` already prevents doubling: it rejects a stale
+resubmission outright rather than silently recomputing the same cart and
+redirecting to checkout again, and it's the only thing that would still
+protect against doubling if WooCommerce's session storage ever stopped being
+a single atomic whole-session write. A token that outlives its intended
+window (see the cache TTL note above — tokens are deliberately **not**
+folded into `ll_windowed_key()`, unlike the throttle, precisely because an
+idempotency check must err toward "still seen," never "forgot too early") is
+therefore benign: worst case is one wasted, correctly-idempotent round trip
+through checkout, never a doubled order.
 
 **Rate limiting** uses the same per-client/global helpers as `/quote`, but
 its own bucket names (`handoff`, both per-client and global). Sharing

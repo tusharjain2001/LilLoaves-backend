@@ -425,19 +425,35 @@ function ll_origin_of($url) {
 }
 
 /**
- * Fails closed: if neither header is present, this returns false. A naive
- * "if present and not allowed, reject" lets an absent header through —
- * this checks presence itself, not only mismatch.
+ * Fails closed: if neither header is present, this returns null. A naive
+ * "if present and not allowed, reject" lets an absent header through — this
+ * checks presence itself, not only mismatch. Returns the *matched allowlist
+ * entry* (never the raw header) so a later rejection can send a local-dev
+ * request back to localhost instead of always defaulting to production —
+ * still safe, because the return value is always one of our own configured
+ * origins, filtered by the header, never the header's value itself.
  */
-function ll_origin_ok() {
+function ll_matched_origin() {
     $candidate = $_SERVER['HTTP_ORIGIN'] ?? ($_SERVER['HTTP_REFERER'] ?? '');
-    if ($candidate === '') return false;
-    return in_array(ll_origin_of($candidate), ll_storefront_origins(), true);
+    if ($candidate === '') return null;
+    $origin = ll_origin_of($candidate);
+    return in_array($origin, ll_storefront_origins(), true) ? $origin : null;
 }
 
-/** Never wp_die() — a bakery customer must never see a raw WordPress error page. */
-function ll_reject($code) {
-    wp_safe_redirect(ll_storefront_url() . '/cart?error=' . rawurlencode($code));
+function ll_origin_ok() {
+    return ll_matched_origin() !== null;
+}
+
+/**
+ * Never wp_die() — a bakery customer must never see a raw WordPress error
+ * page. $base, when given, must be a value already validated against the
+ * allowlist (see ll_matched_origin()) — never pass a raw header through
+ * here, or this becomes an open redirect. Defaults to the first allowlisted
+ * origin for rejections that happen before/without a validated origin to
+ * hand back (the guard, and the origin check's own failure).
+ */
+function ll_reject($code, $base = null) {
+    wp_safe_redirect(($base ?? ll_storefront_url()) . '/cart?error=' . rawurlencode($code));
     exit;
 }
 
@@ -490,8 +506,14 @@ function ll_handoff() {
 
     // 3. Origin check — fail closed. This is a genuine browser form POST
     // (unlike /quote's server-to-server call), so Origin/Referer is a real,
-    // unforgeable-by-a-third-party signal here. See the README.
-    if (!ll_origin_ok()) {
+    // unforgeable-by-a-third-party signal here. See the README. $origin is
+    // the matched *allowlist entry*, not the raw header — every later
+    // ll_reject() below hands it back explicitly so a rejected localhost
+    // dev request returns to localhost instead of always defaulting to
+    // production. Still never an open redirect: $origin can only ever be
+    // one of our own configured origins (see ll_matched_origin()).
+    $origin = ll_matched_origin();
+    if ($origin === null) {
         ll_reject('origin');
     }
 
@@ -500,19 +522,36 @@ function ll_handoff() {
     // to finish checkout.
     $client = ll_client_id_raw();
     if (ll_global_throttled('handoff') || ll_throttled($client, 'handoff', LL_HANDOFF_MAX)) {
-        ll_reject('throttled');
+        ll_reject('throttled', $origin);
     }
 
-    // 5. Idempotency — mark the token seen before doing any work. A crash
-    // partway through then leaves the token spent and a retry lands on an
-    // empty cart, which beats risking a double charge.
+    // 5. Idempotency — mark the token seen before doing any work. Belt and
+    // braces, not the primary safeguard against a doubled order: that's
+    // empty_cart() in step 6 (see its comment). This still earns its keep —
+    // it rejects a stale resubmission outright rather than silently
+    // recomputing and re-redirecting to checkout, and it's the only thing
+    // that would still work if WooCommerce's session storage ever stopped
+    // being a single atomic whole-session write (see step 6).
     $token = ll_post_field('token');
     if ($token === '' || ll_token_seen($token)) {
-        ll_reject('unavailable');
+        ll_reject('unavailable', $origin);
     }
 
-    // 6. Empty the real, persistent session cart before adding anything —
-    // a double-click or a back-then-resubmit must not double the order.
+    // 6. Empty the real, persistent session cart before adding anything.
+    // This — not the token above — is what actually prevents a double-click
+    // or a back-then-resubmit from doubling the order, and it holds for a
+    // genuine concurrent race too, not just a sequential resubmit: verified
+    // live by racing two real, separate PHP processes against the same
+    // WooCommerce session with empty_cart()+add_to_cart(same items), both
+    // with the same token and, separately, with different tokens. In both
+    // cases the persisted cart landed on the single correct quantity, never
+    // doubled. Root cause: WC_Session_Handler persists the entire session
+    // as one atomic blob on save, not as incremental per-item writes — two
+    // racing processes each compute the identical target cart in their own
+    // memory (empty, then add the same items), and whichever save wins
+    // simply overwrites with that same, correct state. There's no shared
+    // mutable structure for the two adds to interleave into. See the
+    // README for the full trace.
     WC()->cart->empty_cart();
 
     $items = json_decode((string) ll_post('items'), true);
@@ -534,7 +573,7 @@ function ll_handoff() {
     }
 
     if (WC()->cart->is_empty()) {
-        ll_reject('unavailable');
+        ll_reject('unavailable', $origin);
     }
 
     $fulfilment = ll_post_field('fulfilment') === 'pickup' ? 'pickup' : 'delivery';
@@ -548,7 +587,7 @@ function ll_handoff() {
         $applied = WC()->cart->apply_coupon($coupon);
         wc_clear_notices();
         if (!$applied) {
-            ll_reject('coupon');
+            ll_reject('coupon', $origin);
         }
     }
 
@@ -559,10 +598,10 @@ function ll_handoff() {
     // leaving no shipping method chosen, which must never reach checkout
     // unnoticed.
     if ($fulfilment === 'delivery' && $postcode === '') {
-        ll_reject('out_of_area');
+        ll_reject('out_of_area', $origin);
     }
     if (ll_apply_fulfilment($fulfilment, $postcode)) {
-        ll_reject($fulfilment === 'delivery' ? 'out_of_area' : 'unavailable');
+        ll_reject($fulfilment === 'delivery' ? 'out_of_area' : 'unavailable', $origin);
     }
 
     WC()->cart->calculate_totals();
@@ -571,7 +610,7 @@ function ll_handoff() {
     $minimum  = (float) get_option('ll_delivery_minimum', 0);
     $subtotal = (float) WC()->cart->get_subtotal();
     if ($fulfilment === 'delivery' && $minimum > 0 && $subtotal < $minimum) {
-        ll_reject('below_minimum');
+        ll_reject('below_minimum', $origin);
     }
 
     // 11. Prefill billing/shipping, sanitised. ll_apply_fulfilment already
