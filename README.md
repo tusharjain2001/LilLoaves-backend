@@ -13,7 +13,9 @@ must-use plugin that prices carts.
   creates no order, and explicitly destroys the WooCommerce session it used
   before returning, so no session row survives a quote either (see below —
   `calculate_totals()` will otherwise persist one regardless of whether a
-  cookie was ever sent).
+  cookie was ever sent). It also registers `admin_post(_nopriv)_ll_handoff`,
+  a top-level browser form POST to `/wp-admin/admin-post.php` that turns
+  that cart into a real WooCommerce order — see further down.
 - `.env` (gitignored) — WordPress.com site URL, SSH/SFTP access, WooCommerce
   object IDs. Copy `.env.example` to `.env` and fill in locally; never commit
   real values.
@@ -168,6 +170,97 @@ client (identified by the `X-LL-Client` header the Vercel proxy sets, or
 `REMOTE_ADDR` as a fallback), plus a global cap of 300 quotes shared across
 all clients. Exceeding either returns HTTP 429 with `{ "errors": [...] }`.
 
+## `POST /wp-admin/admin-post.php` (`action=ll_handoff`)
+
+Turns a browser cart into a real WooCommerce order. Registered on both
+`admin_post_ll_handoff` and `admin_post_nopriv_ll_handoff` so it works for
+guest checkout. This is a genuine **top-level browser form POST** (built by
+`checkout.js` in the frontend repo), not an XHR/fetch — a top-level
+navigation is always first-party, which is why the plan uses a real form
+submit here instead of a `fetch()`-built cart, and it survives Safari's and
+Firefox's third-party cookie blocking that a cross-site `fetch()` would not.
+
+**Origin/Referer, not a shared secret — deliberately the opposite of
+`/quote`.** `/quote` is called server-to-server by the Vercel proxy, which
+sends neither header, so Origin/Referer would check nothing there. The
+handoff is the reverse: it's a real browser submitting a real form, so
+Origin/Referer is a genuine, unforgeable-by-a-third-party signal, and a
+shared secret would be the wrong tool (this endpoint has no server-to-server
+caller to hand a secret to — the "caller" is a customer's browser). Do not
+"harmonise" the two mechanisms onto either endpoint.
+
+Every request must carry an `Origin` or `Referer` matching one of the
+storefront origins in the `ll_storefront_origins` option (an array; defaults
+to `https://lil-loaves.vercel.app` and `http://localhost:5173` if the option
+is unset). **Fails closed**: if both headers are absent, the request is
+rejected — a naive "if present and not allowed, reject" would still let a
+header-stripping client through. Without this check, a third-party page
+could force a victim's browser to submit the real checkout form, landing
+them on a real order prefilled with an attacker's shipping address (CSRF).
+
+**Every rejection redirects to `{storefront}/cart?error=<code>`, never
+`wp_die()`** — a bakery customer must never see a raw WordPress error page.
+The redirect target always comes from the **stored allowlist option**
+(specifically its first entry), never from the incoming Origin/Referer, or
+the failure path becomes an open redirect. Because that target is a
+different domain than this site, it's also registered via the
+`allowed_redirect_hosts` filter — `wp_safe_redirect()` silently falls back
+to `admin_url()` for any host not on that list, which would otherwise turn
+every error case into a confusing redirect to `/wp-admin/`.
+
+Error codes: `origin`, `throttled`, `unavailable` (store not ready, spent
+idempotency token, or a cart that ended up empty), `coupon`, `out_of_area`
+(delivery outside the shipping zone, including a blank postcode — checkout
+is final, unlike `/quote`'s live-typing UX where a blank postcode just means
+"no estimate yet"), `below_minimum`.
+
+**Idempotency.** The client generates a `token` once per cart *state*
+(items, fulfilment, postcode, coupon), not once per click — see Task 9 in
+the frontend repo. The token is marked seen atomically, before any work
+happens: the first submission of a token succeeds, every later one with the
+same token is rejected outright. A submission that crashes partway leaves
+the token spent, so a retry lands on an empty cart rather than risking a
+double charge — a confusing empty cart beats billing someone twice.
+
+**Rate limiting** uses the same per-client/global helpers as `/quote`, but
+its own bucket names (`handoff`, both per-client and global). Sharing
+`/quote`'s bucket would mean a flood aimed at the public `/quote` URL could
+also block real customers from completing checkout, not just from seeing
+quotes.
+
+**Request body** — form fields, not JSON (this is an HTML form POST):
+
+| Field | Value |
+|---|---|
+| `action` | `ll_handoff` |
+| `items` | JSON string, `[{"id":13,"qty":2}]` — ids and quantities only |
+| `fulfilment` | `delivery` or `pickup` |
+| `token` | idempotency token, see above |
+| `coupon` | coupon code, or empty |
+| `email`, `phone`, `first_name`, `last_name` | contact |
+| `address_1`, `address_2`, `city`, `state`, `postcode` | delivery only |
+| `pickup_store`, `pickup_date`, `pickup_slot` | pickup only |
+
+Every price-shaped value a client could send is ignored outright — only
+`id`/`qty` are ever read from `items`, and every line is re-priced from
+WooCommerce's own product data, the same as `/quote`. The coupon is
+re-applied with `WC()->cart->apply_coupon()`; fulfilment is re-validated
+with the same `ll_apply_fulfilment()` `/quote` uses, so a `pickup` claim can
+never yield a delivery rate and an out-of-zone postcode can never yield free
+delivery. The delivery minimum (`ll_delivery_minimum` option, same one
+`/quote` reads) is enforced again here, server-side.
+
+On success, billing/shipping are prefilled onto `WC()->customer` from the
+sanitised POST, a pickup order's store/date/slot ride `WC()->session` onto
+the order (copied to order meta `_ll_pickup_store`/`_ll_pickup_date`/
+`_ll_pickup_slot` on `woocommerce_checkout_create_order`, and shown on the
+admin single-order screen), and the response is
+`wp_safe_redirect(wc_get_checkout_url())` — WooCommerce's own checkout,
+which is where payment (Cash on Delivery, currently the only enabled
+gateway) actually happens and the order is actually created. The handoff
+itself never creates an order; it only prepares the cart and session that
+checkout uses.
+
 ## Store configuration this depends on
 
 Set in `wp-admin` (not in code), and required for the endpoint's shipping
@@ -180,3 +273,15 @@ logic to behave correctly:
   requests, so pickup only resolves if some zone matches a blank postcode —
   that's zone 0. Without `local_pickup` there too, restricting the delivery
   area silently makes pickup unreachable.
+- Cash on Delivery (`cod`) enabled under WooCommerce → Settings → Payments —
+  the only gateway the handoff can currently complete an order through.
+- `ll_storefront_origins` option (array) — the handoff's Origin/Referer
+  allowlist and error-redirect target. Falls back in code to
+  `https://lil-loaves.vercel.app` and `http://localhost:5173` if unset, so
+  the endpoint behaves correctly even before this is explicitly set:
+  ```bash
+  ssh lilloaves-wp "wp option update ll_storefront_origins '[\"https://lil-loaves.vercel.app\",\"http://localhost:5173\"]' --format=json"
+  ```
+- `ll_delivery_minimum` option (float, minor-unit-free decimal, e.g. `25`
+  for $25) — shared with `/quote`. Unset/`0` means no minimum, which is the
+  current, deliberate default.

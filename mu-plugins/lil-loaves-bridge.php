@@ -39,7 +39,7 @@ function ll_wc_ready() {
  * global cap is what actually protects the origin from a distributed burst.
  */
 function ll_throttled($client, $bucket, $max) {
-    return ll_bump('ll_' . $bucket . '_' . md5($client), $max);
+    return ll_bump(ll_windowed_key('ll_' . $bucket . '_' . md5($client)), $max);
 }
 
 /**
@@ -48,15 +48,47 @@ function ll_throttled($client, $bucket, $max) {
  * undercounts precisely under the concurrent bursts that matter. The transient
  * path is only a fallback for a host without a persistent cache.
  */
-function ll_bump($key, $max) {
+function ll_bump($key, $max, $ttl = LL_QUOTE_WINDOW) {
     $group = 'lilloaves';
-    wp_cache_add($key, 0, $group, LL_QUOTE_WINDOW);
+    wp_cache_add($key, 0, $group, $ttl);
     $hits = wp_cache_incr($key, 1, $group);
     if (false === $hits) {
         $hits = (int) get_transient($key) + 1;
-        set_transient($key, $hits, LL_QUOTE_WINDOW);
+        set_transient($key, $hits, $ttl);
     }
     return $hits > $max;
+}
+
+/**
+ * Folds the current time window into the cache key rather than trusting the
+ * backend to honour wp_cache's $expire. Verified directly on this host that
+ * it does not: a value set with a 2-second TTL was still present, unevicted,
+ * 3 seconds later — via both the Object Cache API and the Transients API
+ * (which itself delegates to the object cache whenever one is present, so it
+ * isn't an independent fallback here). Without this, a throttle counter
+ * climbs forever and never comes back down, wedging a client — or, on the
+ * global bucket, every client — behind a rate limit that never lifts. Worse
+ * than no throttle at all on an endpoint that creates real orders.
+ *
+ * A new window number is simply a new, unrelated key, so correctness no
+ * longer depends on the backend ever expiring anything; wp_cache_incr stays
+ * atomic, which a read-then-write reset would not.
+ *
+ * ponytail: fixed window, not sliding — a client can send up to 2x the cap
+ * clustered around a window boundary. Acceptable for a defence-in-depth
+ * throttle (see ll_throttled's own comment above); upgrade to a sliding
+ * window only if that boundary burst becomes an observed problem.
+ *
+ * Deliberately NOT used for ll_token_seen()'s idempotency check below: a
+ * token incorrectly surviving past its window is safe (it just stays
+ * correctly rejected as a duplicate), whereas a token incorrectly expiring
+ * early would defeat the double-charge guard entirely. The two failure
+ * directions aren't symmetric, so the fix that's right for throttling would
+ * be wrong there — token_seen accepts this host's "never expires" behaviour
+ * as a safe, if slightly wasteful, default instead.
+ */
+function ll_windowed_key($key) {
+    return $key . '_w' . (int) floor(time() / LL_QUOTE_WINDOW);
 }
 
 /**
@@ -64,7 +96,7 @@ function ll_bump($key, $max) {
  * lets real customers complete checkout. Task 7 passes its own bucket name.
  */
 function ll_global_throttled($bucket = 'quote') {
-    return ll_bump('ll_global_' . $bucket, 300);   // ~30/s sustained, under the LB's limit
+    return ll_bump(ll_windowed_key('ll_global_' . $bucket), 300);   // ~30/s sustained, under the LB's limit
 }
 
 /**
@@ -222,6 +254,24 @@ function ll_empty_quote() {
 
 /** WooCommerce's cart, session and customer do not exist during a REST request. */
 function ll_boot_cart() {
+    // WooCommerce only include()s these two procedural function files —
+    // defining things WC_Cart::add_to_cart() and apply_coupon() call
+    // internally, like wc_get_cart_item_data_hash() and wc_clear_notices()
+    // — when is_request('frontend') or is_rest_api_request() is true.
+    // Neither is true on admin-post.php, where is_admin() is set before
+    // wp-load.php even runs. /quote never hits this gap because a REST
+    // request already satisfies is_rest_api_request(); the handoff would
+    // otherwise fatal deep inside WC_Cart::add_to_cart() with "Call to
+    // undefined function wc_get_cart_item_data_hash()". include_once is a
+    // no-op if /quote's request already loaded these, so this changes
+    // nothing there.
+    if (!function_exists('wc_get_cart_item_data_hash')) {
+        include_once WC_ABSPATH . 'includes/wc-cart-functions.php';
+    }
+    if (!function_exists('wc_clear_notices')) {
+        include_once WC_ABSPATH . 'includes/wc-notice-functions.php';
+    }
+
     if (null === WC()->session) WC()->initialize_session();
     if (null === WC()->customer) WC()->customer = new WC_Customer(0, true);
     if (null === WC()->cart) WC()->initialize_cart();
@@ -315,3 +365,293 @@ function ll_currency() {
 function ll_minor($amount) {
     return (int) round(((float) $amount) * (10 ** wc_get_price_decimals()));
 }
+
+/* -------------------------------------------------------------------------
+ * Checkout handoff — turns the browser's cart into a real WooCommerce order.
+ * Runs on admin_post_ll_handoff / admin_post_nopriv_ll_handoff, a genuine
+ * top-level browser form POST (see Task 9's checkout.js), never an XHR — so
+ * unlike /quote it is gated by Origin/Referer, not a shared secret. See the
+ * README for why the two endpoints use different gates; don't harmonise them.
+ * ---------------------------------------------------------------------- */
+
+const LL_HANDOFF_MAX       = 10;    // handoff attempts per window per client
+const LL_HANDOFF_TOKEN_TTL = 3600;  // seconds an idempotency token stays claimed
+
+add_action('admin_post_ll_handoff', 'll_handoff');
+add_action('admin_post_nopriv_ll_handoff', 'll_handoff');
+
+/**
+ * Storefronts allowed to submit the handoff, and the only source of truth
+ * for where a rejected request is sent back to — never the incoming
+ * Origin/Referer, or the failure path becomes an open redirect. First entry
+ * doubles as the default redirect target for a request whose origin isn't
+ * trustworthy enough to redirect back to (foreign or missing).
+ */
+function ll_storefront_origins() {
+    $stored  = get_option('ll_storefront_origins', []);
+    $origins = is_array($stored) && $stored
+        ? $stored
+        : ['https://lil-loaves.vercel.app', 'http://localhost:5173'];
+    return array_map('untrailingslashit', $origins);
+}
+
+function ll_storefront_url() {
+    $origins = ll_storefront_origins();
+    return $origins[0];
+}
+
+/**
+ * wp_safe_redirect() only follows this site's own host plus whatever is
+ * registered here. The storefront lives on a different domain (Vercel), so
+ * without this every ll_reject() below would silently land on /wp-admin/
+ * instead of the storefront's /cart — a must-use plugin can't afford a
+ * "safe" redirect that quietly isn't.
+ */
+add_filter('allowed_redirect_hosts', function ($hosts) {
+    foreach (ll_storefront_origins() as $origin) {
+        $host = wp_parse_url($origin, PHP_URL_HOST);
+        if ($host) $hosts[] = $host;
+    }
+    return $hosts;
+});
+
+/** scheme://host[:port] only — enough to compare against the allowlist. */
+function ll_origin_of($url) {
+    $parts = wp_parse_url((string) $url);
+    if (empty($parts['scheme']) || empty($parts['host'])) return '';
+    $origin = $parts['scheme'] . '://' . $parts['host'];
+    if (!empty($parts['port'])) $origin .= ':' . $parts['port'];
+    return $origin;
+}
+
+/**
+ * Fails closed: if neither header is present, this returns false. A naive
+ * "if present and not allowed, reject" lets an absent header through —
+ * this checks presence itself, not only mismatch.
+ */
+function ll_origin_ok() {
+    $candidate = $_SERVER['HTTP_ORIGIN'] ?? ($_SERVER['HTTP_REFERER'] ?? '');
+    if ($candidate === '') return false;
+    return in_array(ll_origin_of($candidate), ll_storefront_origins(), true);
+}
+
+/** Never wp_die() — a bakery customer must never see a raw WordPress error page. */
+function ll_reject($code) {
+    wp_safe_redirect(ll_storefront_url() . '/cart?error=' . rawurlencode($code));
+    exit;
+}
+
+/**
+ * The handoff is a direct browser navigation to this site, not a request
+ * proxied through Vercel — REMOTE_ADDR is the real customer's IP here,
+ * unlike /quote where it's Vercel's egress IP.
+ */
+function ll_client_id_raw() {
+    return isset($_SERVER['REMOTE_ADDR']) ? sanitize_text_field($_SERVER['REMOTE_ADDR']) : 'unknown';
+}
+
+/**
+ * Claim-once check, built on the same atomic counter ll_bump already uses
+ * for throttling: max=1 means the first call (hits=1) returns false — "not
+ * seen yet" — and every later call on the same token (hits>=2) returns
+ * true. The increment itself is the check, so there's no window between
+ * "check" and "mark seen" for two racing requests to both land in.
+ */
+function ll_token_seen($token) {
+    return ll_bump('ll_token_' . md5($token), 1, LL_HANDOFF_TOKEN_TTL);
+}
+
+function ll_post($key) {
+    return isset($_POST[$key]) ? wp_unslash($_POST[$key]) : '';
+}
+
+function ll_post_field($key) {
+    return sanitize_text_field((string) ll_post($key));
+}
+
+/**
+ * Turns a browser cart into a real WooCommerce order. Step numbers match
+ * the brief; each depends on the ones before it having already run.
+ */
+function ll_handoff() {
+    // 1. Guard — never fatal even if WooCommerce isn't available. Reading
+    // the allowlist option doesn't need WooCommerce, so this still goes
+    // through the normal reject path rather than a bespoke one.
+    if (!ll_wc_ready()) {
+        ll_reject('unavailable');
+    }
+
+    // 2. Boot the cart. admin-post.php defines WP_ADMIN before wp-load.php
+    // runs, so is_admin() is true for this entire request and WooCommerce
+    // never auto-creates WC()->cart/session/customer the way it does on a
+    // normal frontend request. ll_wc_ready() does not cover this — it only
+    // checks that the WC_Cart class exists, not that the object was booted.
+    ll_boot_cart();
+
+    // 3. Origin check — fail closed. This is a genuine browser form POST
+    // (unlike /quote's server-to-server call), so Origin/Referer is a real,
+    // unforgeable-by-a-third-party signal here. See the README.
+    if (!ll_origin_ok()) {
+        ll_reject('origin');
+    }
+
+    // 4. Throttle — its own global bucket ('handoff', not /quote's), so a
+    // flood aimed at /quote can never spend the budget real customers need
+    // to finish checkout.
+    $client = ll_client_id_raw();
+    if (ll_global_throttled('handoff') || ll_throttled($client, 'handoff', LL_HANDOFF_MAX)) {
+        ll_reject('throttled');
+    }
+
+    // 5. Idempotency — mark the token seen before doing any work. A crash
+    // partway through then leaves the token spent and a retry lands on an
+    // empty cart, which beats risking a double charge.
+    $token = ll_post_field('token');
+    if ($token === '' || ll_token_seen($token)) {
+        ll_reject('unavailable');
+    }
+
+    // 6. Empty the real, persistent session cart before adding anything —
+    // a double-click or a back-then-resubmit must not double the order.
+    WC()->cart->empty_cart();
+
+    $items = json_decode((string) ll_post('items'), true);
+    if (!is_array($items)) $items = [];
+
+    // 7. Re-price every line from WooCommerce's own product data. Only id
+    // and qty are ever read from the POST — nothing price-shaped a client
+    // could tamper with is ever looked at, let alone trusted.
+    foreach ($items as $item) {
+        $id  = absint($item['id'] ?? 0);
+        $qty = max(1, absint($item['qty'] ?? 1));
+        if (!$id) continue;
+
+        $product = wc_get_product($id);
+        if (!$product || $product->get_status() !== 'publish' || !$product->is_purchasable() || !$product->is_in_stock()) {
+            continue; // no response channel to explain why; it just won't be in the cart
+        }
+        WC()->cart->add_to_cart($id, $qty);
+    }
+
+    if (WC()->cart->is_empty()) {
+        ll_reject('unavailable');
+    }
+
+    $fulfilment = ll_post_field('fulfilment') === 'pickup' ? 'pickup' : 'delivery';
+    $postcode   = ll_post_field('postcode');
+
+    // 8. Apply the coupon the client saw at quote time, same call /quote
+    // uses. If it no longer validates, stop rather than silently charging
+    // more than was quoted.
+    $coupon = ll_post_field('coupon');
+    if ($coupon !== '') {
+        $applied = WC()->cart->apply_coupon($coupon);
+        wc_clear_notices();
+        if (!$applied) {
+            ll_reject('coupon');
+        }
+    }
+
+    // 9. Re-validate fulfilment with the same helper /quote uses. A blank
+    // delivery postcode is fine mid-quote (the customer just hasn't typed
+    // one in yet) but is fatal here — checkout is final, and
+    // ll_apply_fulfilment's "no postcode yet" branch reports no error while
+    // leaving no shipping method chosen, which must never reach checkout
+    // unnoticed.
+    if ($fulfilment === 'delivery' && $postcode === '') {
+        ll_reject('out_of_area');
+    }
+    if (ll_apply_fulfilment($fulfilment, $postcode)) {
+        ll_reject($fulfilment === 'delivery' ? 'out_of_area' : 'unavailable');
+    }
+
+    WC()->cart->calculate_totals();
+
+    // 10. Delivery minimum, same option /quote reads.
+    $minimum  = (float) get_option('ll_delivery_minimum', 0);
+    $subtotal = (float) WC()->cart->get_subtotal();
+    if ($fulfilment === 'delivery' && $minimum > 0 && $subtotal < $minimum) {
+        ll_reject('below_minimum');
+    }
+
+    // 11. Prefill billing/shipping, sanitised. ll_apply_fulfilment already
+    // set the postcode as part of choosing a shipping rate; this fills in
+    // the rest of the address and contact details.
+    $first_name = ll_post_field('first_name');
+    $last_name  = ll_post_field('last_name');
+    $email      = sanitize_email((string) ll_post('email'));
+    $phone      = ll_post_field('phone');
+
+    WC()->customer->set_billing_first_name($first_name);
+    WC()->customer->set_billing_last_name($last_name);
+    WC()->customer->set_billing_email($email);
+    WC()->customer->set_billing_phone($phone);
+    WC()->customer->set_shipping_first_name($first_name);
+    WC()->customer->set_shipping_last_name($last_name);
+
+    if ($fulfilment === 'delivery') {
+        $address_1 = ll_post_field('address_1');
+        $address_2 = ll_post_field('address_2');
+        $city      = ll_post_field('city');
+        $state     = ll_post_field('state');
+
+        WC()->customer->set_billing_address_1($address_1);
+        WC()->customer->set_billing_address_2($address_2);
+        WC()->customer->set_billing_city($city);
+        WC()->customer->set_billing_state($state);
+        WC()->customer->set_shipping_address_1($address_1);
+        WC()->customer->set_shipping_address_2($address_2);
+        WC()->customer->set_shipping_city($city);
+        WC()->customer->set_shipping_state($state);
+    }
+
+    WC()->customer->save();
+
+    // 12. Pickup store/date/slot ride the session into the order — the
+    // woocommerce_checkout_create_order hook below copies this onto order
+    // meta once the order actually exists, and the admin hook further down
+    // displays it.
+    WC()->session->set('ll_pickup', $fulfilment === 'pickup' ? [
+        'store' => ll_post_field('pickup_store'),
+        'date'  => ll_post_field('pickup_date'),
+        'slot'  => ll_post_field('pickup_slot'),
+    ] : null);
+
+    // 13. Hand off to WooCommerce's own checkout.
+    wp_safe_redirect(wc_get_checkout_url());
+    exit;
+}
+
+/** Copies session pickup data onto the order once it exists. */
+function ll_copy_pickup_meta_to_order($order) {
+    if (!ll_wc_ready() || null === WC()->session) return;
+    $pickup = WC()->session->get('ll_pickup');
+    if (!is_array($pickup)) return;
+    $order->update_meta_data('_ll_pickup_store', $pickup['store'] ?? '');
+    $order->update_meta_data('_ll_pickup_date', $pickup['date'] ?? '');
+    $order->update_meta_data('_ll_pickup_slot', $pickup['slot'] ?? '');
+}
+
+// This store's checkout page is the block/Store API checkout (verified live),
+// whose order creation (StoreApi\Utilities\OrderController) never fires the
+// classic woocommerce_checkout_create_order action at all — only classic
+// shortcode checkout does. The Store API's own equivalent is
+// woocommerce_store_api_checkout_order_processed, fired *after* the order is
+// already saved, so it needs an explicit save() where the classic hook (order
+// not yet saved; the caller saves it) doesn't. Both are registered so this
+// keeps working if the checkout page type ever changes back.
+add_action('woocommerce_checkout_create_order', 'll_copy_pickup_meta_to_order');
+add_action('woocommerce_store_api_checkout_order_processed', function ($order) {
+    ll_copy_pickup_meta_to_order($order);
+    $order->save();
+});
+
+/** Shows pickup store/date/slot on the admin single-order screen. */
+add_action('woocommerce_admin_order_data_after_shipping_address', function ($order) {
+    $store = $order->get_meta('_ll_pickup_store');
+    if ($store === '') return; // not a pickup order, nothing to show
+    echo '<p class="ll-pickup-meta"><strong>' . esc_html__('Pickup', 'lilloaves') . ':</strong><br>'
+        . esc_html($store) . '<br>'
+        . esc_html($order->get_meta('_ll_pickup_date')) . ' ' . esc_html($order->get_meta('_ll_pickup_slot'))
+        . '</p>';
+});
