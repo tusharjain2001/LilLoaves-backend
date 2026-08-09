@@ -285,13 +285,36 @@ delivery. The delivery minimum (`ll_delivery_minimum` option, same one
 On success, billing/shipping are prefilled onto `WC()->customer` from the
 sanitised POST, a pickup order's store/date/slot ride `WC()->session` onto
 the order (copied to order meta `_ll_pickup_store`/`_ll_pickup_date`/
-`_ll_pickup_slot` on `woocommerce_checkout_create_order`, and shown on the
-admin single-order screen), and the response is
-`wp_safe_redirect(wc_get_checkout_url())` — WooCommerce's own checkout,
-which is where payment (Cash on Delivery, currently the only enabled
-gateway) actually happens and the order is actually created. The handoff
-itself never creates an order; it only prepares the cart and session that
-checkout uses.
+`_ll_pickup_slot`, and shown on the admin single-order screen), and the
+response is `wp_safe_redirect(wc_get_checkout_url())` — WooCommerce's own
+checkout, which is where payment (Cash on Delivery, currently the only
+enabled gateway) actually happens and the order is actually created. The
+handoff itself never creates an order; it only prepares the cart and session
+that checkout uses.
+
+**After payment, the customer returns to the storefront's own
+`/order-confirmed?order=<order number>`, not WooCommerce's thank-you page.**
+Two order-meta flags travel with the order for this: `_ll_from_handoff`
+(marks it as ours) and `_ll_origin` (the storefront origin — the matched
+allowlist entry, never a raw header — that submitted the handoff, so a
+local-dev order returns to `localhost` and a production one to
+`lil-loaves.vercel.app`). Both are copied from `WC()->session` onto the
+order by the same hooks that copy pickup meta (see above). A
+`woocommerce_get_checkout_order_received_url` filter checks for
+`_ll_from_handoff` and, only when present, rewrites the URL; an order that
+reached WooCommerce checkout some other way is untouched (verified: a plain
+order with no handoff meta still gets WooCommerce's own
+`/checkout/order-received/<id>/` URL).
+
+This filter, not `woocommerce_thankyou`/`get_return_url`, is the correct
+hook **verified against this store's actual checkout type**: the block/Store
+API checkout's `CheckoutTrait` calls `$order->get_checkout_order_received_url()`
+directly, and the classic COD gateway's `get_return_url()` reaches the same
+method internally — `woocommerce_get_checkout_order_received_url` is the
+filter applied *inside* that one shared method, so it fires either way.
+Confirmed live: a completed COD order's `payment_result.redirect_url` (the
+field the block checkout's JS actually navigates to) came back as
+`https://lil-loaves.vercel.app/order-confirmed?order=<n>`.
 
 ## Store configuration this depends on
 

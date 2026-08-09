@@ -646,10 +646,15 @@ function ll_handoff() {
 
     WC()->customer->save();
 
-    // 12. Pickup store/date/slot ride the session into the order — the
-    // woocommerce_checkout_create_order hook below copies this onto order
-    // meta once the order actually exists, and the admin hook further down
-    // displays it.
+    // 12. Pickup store/date/slot, and the fact that this order came through
+    // our handoff at all (plus which storefront origin it came from), ride
+    // the session into the order — the hooks below copy this onto order
+    // meta once the order actually exists. ll_from_handoff is what lets the
+    // post-payment redirect filter (further down) tell "this order came
+    // through us" apart from any order reaching WooCommerce checkout some
+    // other way, which must keep WooCommerce's own default behaviour.
+    WC()->session->set('ll_from_handoff', true);
+    WC()->session->set('ll_origin', $origin);
     WC()->session->set('ll_pickup', $fulfilment === 'pickup' ? [
         'store' => ll_post_field('pickup_store'),
         'date'  => ll_post_field('pickup_date'),
@@ -661,14 +666,20 @@ function ll_handoff() {
     exit;
 }
 
-/** Copies session pickup data onto the order once it exists. */
-function ll_copy_pickup_meta_to_order($order) {
+/** Copies session handoff/pickup data onto the order once it exists. */
+function ll_copy_handoff_meta_to_order($order) {
     if (!ll_wc_ready() || null === WC()->session) return;
+    if (!WC()->session->get('ll_from_handoff')) return;
+
+    $order->update_meta_data('_ll_from_handoff', '1');
+    $order->update_meta_data('_ll_origin', (string) WC()->session->get('ll_origin', ''));
+
     $pickup = WC()->session->get('ll_pickup');
-    if (!is_array($pickup)) return;
-    $order->update_meta_data('_ll_pickup_store', $pickup['store'] ?? '');
-    $order->update_meta_data('_ll_pickup_date', $pickup['date'] ?? '');
-    $order->update_meta_data('_ll_pickup_slot', $pickup['slot'] ?? '');
+    if (is_array($pickup)) {
+        $order->update_meta_data('_ll_pickup_store', $pickup['store'] ?? '');
+        $order->update_meta_data('_ll_pickup_date', $pickup['date'] ?? '');
+        $order->update_meta_data('_ll_pickup_slot', $pickup['slot'] ?? '');
+    }
 }
 
 // This store's checkout page is the block/Store API checkout (verified live),
@@ -679,11 +690,44 @@ function ll_copy_pickup_meta_to_order($order) {
 // already saved, so it needs an explicit save() where the classic hook (order
 // not yet saved; the caller saves it) doesn't. Both are registered so this
 // keeps working if the checkout page type ever changes back.
-add_action('woocommerce_checkout_create_order', 'll_copy_pickup_meta_to_order');
+add_action('woocommerce_checkout_create_order', 'll_copy_handoff_meta_to_order');
 add_action('woocommerce_store_api_checkout_order_processed', function ($order) {
-    ll_copy_pickup_meta_to_order($order);
+    ll_copy_handoff_meta_to_order($order);
     $order->save();
 });
+
+/**
+ * Sends a customer back to the storefront's own confirmation page after
+ * paying, instead of leaving them on WooCommerce's thank-you page (which
+ * looks nothing like the bakery). Only for orders that came through our
+ * handoff — order meta, not a guess — so a customer who somehow reaches
+ * WooCommerce checkout by another route keeps WooCommerce's own behaviour.
+ *
+ * Verified live which hook actually fires here rather than assuming: the
+ * classic `woocommerce_thankyou`/return-URL path is a template-rendering
+ * hook that only runs on the classic shortcode checkout, which this store
+ * doesn't use (same trap as the pickup-meta hook above). What both the
+ * classic *and* block/Store API checkout genuinely share is
+ * `WC_Order::get_checkout_order_received_url()` itself — confirmed by
+ * reading WooCommerce core: the Store API's CheckoutTrait calls it directly
+ * for a $0 order, and COD's classic `process_payment()` reaches it via
+ * `get_return_url()`. `woocommerce_get_checkout_order_received_url` is the
+ * filter applied *inside* that method, so it's hit either way. Confirmed
+ * live: completing a real COD order returned
+ * `.../order-confirmed?order=<n>` in `payment_result.redirect_url`, the
+ * exact field the block checkout's JS navigates to.
+ *
+ * The redirect target is the order's own stored `_ll_origin` — the
+ * allowlist entry that matched at handoff time, never a raw header — so a
+ * local-dev order returns to localhost instead of production. Falls back to
+ * the default allowlist entry only if that's somehow missing.
+ */
+add_filter('woocommerce_get_checkout_order_received_url', function ($url, $order) {
+    if (!$order || !$order->get_meta('_ll_from_handoff')) return $url;
+    $origin = (string) $order->get_meta('_ll_origin');
+    $base   = $origin !== '' ? $origin : ll_storefront_url();
+    return $base . '/order-confirmed?order=' . rawurlencode($order->get_order_number());
+}, 10, 2);
 
 /** Shows pickup store/date/slot on the admin single-order screen. */
 add_action('woocommerce_admin_order_data_after_shipping_address', function ($order) {
