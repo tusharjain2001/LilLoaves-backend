@@ -2,7 +2,8 @@
 
 WordPress.com backend for the Lil' Loaves bakery. Holds server-side glue
 between the React storefront and WooCommerce — currently a single
-must-use plugin that prices carts.
+must-use plugin that prices carts, schedules pickup, and hands checkout to
+WooCommerce.
 
 ## What's here
 
@@ -15,7 +16,10 @@ must-use plugin that prices carts.
   `calculate_totals()` will otherwise persist one regardless of whether a
   cookie was ever sent). It also registers `admin_post(_nopriv)_ll_handoff`,
   a top-level browser form POST to `/wp-admin/admin-post.php` that turns
-  that cart into a real WooCommerce order — see further down.
+  that cart into a real WooCommerce order — see further down. Also adds a
+  `WooCommerce > Fulfilment` settings screen, a public
+  `GET /wp-json/lilloaves/v1/pickup` read endpoint, and branding for
+  WooCommerce's own confirmation emails — see the matching sections below.
 - `.env` (gitignored) — WordPress.com site URL, SSH/SFTP access, WooCommerce
   object IDs. Copy `.env.example` to `.env` and fill in locally; never commit
   real values.
@@ -218,7 +222,9 @@ Error codes: `origin`, `throttled`, `unavailable` (store not ready, spent
 idempotency token, or a cart that ended up empty), `coupon`, `out_of_area`
 (delivery outside the shipping zone, including a blank postcode — checkout
 is final, unlike `/quote`'s live-typing UX where a blank postcode just means
-"no estimate yet"), `below_minimum`.
+"no estimate yet"), `below_minimum`, `bad_slot` (pickup only — the
+`pickup_store`/`pickup_date`/`pickup_slot` combination isn't one
+`GET /wp-json/lilloaves/v1/pickup` would currently offer; see below).
 
 **What actually prevents a doubled order — `empty_cart()`, not the
 idempotency token.** The handler always empties the real WooCommerce session
@@ -339,4 +345,93 @@ logic to behave correctly:
   ```
 - `ll_delivery_minimum` option (float, minor-unit-free decimal, e.g. `25`
   for $25) — shared with `/quote`. Unset/`0` means no minimum, which is the
-  current, deliberate default.
+  current, deliberate default. Editable from `WooCommerce > Fulfilment`
+  (see below), not just via WP-CLI.
+
+## Pickup scheduling
+
+### `WooCommerce > Fulfilment` (wp-admin screen)
+
+Where a non-technical bakery owner sets everything below with no code —
+`add_submenu_page('woocommerce', ...)`, hand-rolled POST handling (no
+Settings API — it has no concept of a repeatable "+ Add store" group), one
+option (`ll_fulfilment_stores`, an array) plus the existing
+`ll_delivery_minimum`. Per store:
+
+| Field | Notes |
+|---|---|
+| Store name | Also becomes the public `id` (slugified) the REST endpoint and handoff use |
+| Address | Free text, shown to the customer |
+| Collection days | Checkboxes, Sun–Sat |
+| Collection hours | `start`/`end`, `HH:MM` |
+| Slot length | Minutes; slots are generated `start` → `end` in this increment |
+| Blackout dates | Textarea, one per line or comma-separated, `YYYY-MM-DD`; invalid/impossible dates are silently dropped, not saved |
+| Show the next N weeks | How far ahead `GET /pickup` generates dates |
+| Remove this store | Checkbox; dropped from the array on save |
+
+"+ Add store" appends a blank store block and saves immediately (so a page
+refresh doesn't lose it) — same form, same POST/redirect/GET save handler
+(`admin_init`, nonce `ll_save_fulfilment`, capability `manage_woocommerce`).
+Delivery minimum lives on the same page since it's the same "how fulfilment
+works" concern, previously only settable via WP-CLI.
+
+### `GET /wp-json/lilloaves/v1/pickup`
+
+Public, read-only, **no `X-LL-Secret` required** — unlike `/quote`, this
+creates nothing and exposes only a store's name/address/hours, which isn't
+sensitive. Generates real calendar dates and time slots server-side from
+each store's weekly pattern, honouring blackout dates and the weeks-ahead
+setting, so the client does zero date arithmetic.
+
+```json
+{
+  "stores": [
+    {
+      "id": "orange-county-store",
+      "name": "Orange County Store",
+      "address": "1234 Example Ave, Orange County, CA",
+      "slot_minutes": 30,
+      "slots": [
+        { "start": "14:00", "end": "14:30", "label": "2:00 PM - 2:30 PM" }
+      ],
+      "dates": [
+        { "date": "2026-08-09", "weekday": "Sunday", "label": "9 Aug" }
+      ]
+    }
+  ],
+  "delivery_minimum": 0,
+  "currency": { "currency_code": "USD", "...": "same shape as /quote's currency object" }
+}
+```
+
+`slots` and `dates` are deliberately separate arrays, not one flat list of
+combos — the same slots apply on every open day (no per-slot capacity, so
+nothing is date-specific about a slot), and crossing them client-side is one
+nested loop. `date` (`Y-m-d`) and `slot.start`/`slot.end` (`H:i`) are the
+**canonical values a handoff POST must send back** as `pickup_date` and
+`pickup_slot="{start}-{end}"` (e.g. `14:00-14:30`) — `label` fields are
+display-only. A store row with a blank name (an unfilled "+ Add store"
+block) is omitted from the response.
+
+An unfortunate discovery while testing this live: WordPress.com's edge/CDN
+caches this endpoint's `GET` responses (`Server-Timing: ...cache;desc=HIT`
+observed on a second request within seconds). Harmless for how this data is
+used — pickup slots don't need per-second freshness — but worth knowing if
+a future change here seems to "not take effect" immediately; a cache-busting
+query string (`?_=<timestamp>`) confirms the real current state.
+
+### Handoff validation (`bad_slot`)
+
+`ll_handoff()` now rejects a pickup order whose `pickup_store`/
+`pickup_date`/`pickup_slot` isn't one the store would actually offer right
+now, via `ll_pickup_slot_valid()` — the exact same functions
+`GET /pickup` uses to generate its lists, so the two can never disagree.
+Same trust principle as re-pricing every line item: the client's slot claim
+is a request, not an instruction. `pickup_store` matches either the
+generated `id` (slug) or the store's exact display name (case-insensitive) —
+the name match exists because the live storefront currently sends the
+store's literal name (`"Orange County Store"`), not a slug.
+
+No per-slot capacity — deliberately out of scope (avoids a reservation race
+at checkout), same as `/quote`.
+

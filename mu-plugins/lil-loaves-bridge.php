@@ -367,6 +367,374 @@ function ll_minor($amount) {
 }
 
 /* -------------------------------------------------------------------------
+ * Pickup scheduling — a wp-admin settings screen for stores/hours/blackout
+ * dates, a public read endpoint that turns that config into real upcoming
+ * dates, and handoff-time validation so a client can never claim a slot the
+ * store doesn't actually offer. Same trust principle as re-pricing in
+ * /quote and ll_handoff below: the client's slot choice is a request, not
+ * an instruction, and gets checked against what the server would generate
+ * right now.
+ * ---------------------------------------------------------------------- */
+
+const LL_FULFILMENT_OPTION = 'll_fulfilment_stores';
+const LL_FULFILMENT_PAGE   = 'll-fulfilment';
+
+/** Weekday ints follow PHP's date('w'): 0 = Sunday ... 6 = Saturday, so a
+ *  stored day list compares directly against date('w') with no lookup. */
+function ll_weekday_labels() {
+    return [0 => 'Sun', 1 => 'Mon', 2 => 'Tue', 3 => 'Wed', 4 => 'Thu', 5 => 'Fri', 6 => 'Sat'];
+}
+
+/** Fills in every field a stored store might be missing, so the rest of this
+ *  file never has to null-check them one at a time. */
+function ll_store_defaults($store) {
+    $store = is_array($store) ? $store : [];
+    return array_merge([
+        'name'         => '',
+        'address'      => '',
+        'days'         => [],
+        'start'        => '',
+        'end'          => '',
+        'slot_minutes' => 30,
+        'blackout'     => [],
+        'weeks_ahead'  => 4,
+    ], $store);
+}
+
+function ll_fulfilment_stores() {
+    $stores = get_option(LL_FULFILMENT_OPTION, []);
+    return is_array($stores) ? array_map('ll_store_defaults', $stores) : [];
+}
+
+/**
+ * ponytail: id collisions across two stores whose names strip down to the
+ * same slug aren't de-duplicated — acceptable for a single bakery with one
+ * or two locations; revisit with a stored uuid if a client ever runs many
+ * stores with near-identical names.
+ */
+function ll_store_id($name, $index) {
+    $slug = sanitize_title((string) $name);
+    return $slug !== '' ? $slug : 'store-' . $index;
+}
+
+/**
+ * Matches a pickup_store value against either the generated id/slug or the
+ * store's exact display name (case-insensitive). The name match exists
+ * because the live storefront (Cart.jsx) currently sends the store's literal
+ * name, not a slug — see the README for the frontend field contract this is
+ * pinned against; a future frontend using the /pickup endpoint's own `id`
+ * keeps working through the first check.
+ */
+function ll_find_store($value) {
+    $value = trim((string) $value);
+    if ($value === '') return null;
+
+    $stores = ll_fulfilment_stores();
+    foreach ($stores as $i => $store) {
+        if (ll_store_id($store['name'], $i) === $value) return $store;
+    }
+    foreach ($stores as $store) {
+        if ($store['name'] !== '' && strcasecmp(trim($store['name']), $value) === 0) return $store;
+    }
+    return null;
+}
+
+/**
+ * Expands a store's weekly pattern into real calendar dates for the next
+ * N weeks, skipping blackout dates. This is the only place dates get
+ * computed — both the public endpoint and the handoff validator call it, so
+ * they can never disagree with each other about what's on offer.
+ */
+function ll_store_upcoming_dates($store) {
+    $days = array_map('intval', (array) ($store['days'] ?? []));
+    if (!$days) return [];
+
+    $weeks_ahead = max(1, min(52, (int) ($store['weeks_ahead'] ?? 4)));
+    $blackout    = array_flip(array_filter((array) ($store['blackout'] ?? [])));
+
+    $tz      = wp_timezone();
+    $cursor  = new DateTime('today', $tz);
+    $horizon = (clone $cursor)->modify('+' . ($weeks_ahead * 7 - 1) . ' days');
+
+    $dates = [];
+    while ($cursor <= $horizon) {
+        $iso = $cursor->format('Y-m-d');
+        if (in_array((int) $cursor->format('w'), $days, true) && !isset($blackout[$iso])) {
+            $dates[] = [
+                'date'    => $iso,
+                'weekday' => $cursor->format('l'),
+                'label'   => $cursor->format('j M'),
+            ];
+        }
+        $cursor->modify('+1 day');
+    }
+    return $dates;
+}
+
+/**
+ * Generates the fixed daily time slots from a store's start/end/length. The
+ * same slots apply on every open day, so this is independent of
+ * ll_store_upcoming_dates() above rather than one computed per date — no
+ * per-slot capacity means there is nothing date-specific about a slot.
+ */
+function ll_store_slots($store) {
+    $length = max(5, (int) ($store['slot_minutes'] ?? 30));
+    $tz     = wp_timezone();
+    $start  = DateTime::createFromFormat('H:i', (string) ($store['start'] ?? ''), $tz);
+    $end    = DateTime::createFromFormat('H:i', (string) ($store['end'] ?? ''), $tz);
+    if (!$start || !$end || $start >= $end) return [];
+
+    $slots  = [];
+    $cursor = $start;
+    while (true) {
+        $next = (clone $cursor)->modify('+' . $length . ' minutes');
+        if ($next > $end) break;
+        $slots[] = [
+            'start' => $cursor->format('H:i'),
+            'end'   => $next->format('H:i'),
+            'label' => $cursor->format('g:i A') . ' - ' . $next->format('g:i A'),
+        ];
+        $cursor = $next;
+    }
+    return $slots;
+}
+
+/**
+ * The handoff-time authority for "is this a slot the store would actually
+ * offer right now" — reuses the exact functions the public /pickup endpoint
+ * returns, so a slot that endpoint offered can never be rejected here, and
+ * one it didn't offer can never sneak through here either. $store_id
+ * accepts anything ll_find_store() accepts (slug or exact name).
+ */
+function ll_pickup_slot_valid($store_id, $date, $slot) {
+    $store = ll_find_store($store_id);
+    if (!$store) return false;
+
+    $date_ok = false;
+    foreach (ll_store_upcoming_dates($store) as $d) {
+        if ($d['date'] === $date) { $date_ok = true; break; }
+    }
+    if (!$date_ok) return false;
+
+    foreach (ll_store_slots($store) as $s) {
+        if ($s['start'] . '-' . $s['end'] === $slot) return true;
+    }
+    return false;
+}
+
+/**
+ * Public, read-only, no secret required (unlike /quote): a store's name,
+ * address and generated slot list isn't sensitive, and the client needs to
+ * be able to render it before it has ever formed a cart. Guarded on
+ * ll_wc_ready() only so ll_minor()/ll_currency() below never run against a
+ * WooCommerce that isn't there yet — same reasoning as /quote's guard.
+ */
+add_action('rest_api_init', function () {
+    if (!ll_wc_ready()) return;
+    register_rest_route('lilloaves/v1', '/pickup', [
+        'methods'             => 'GET',
+        'permission_callback' => '__return_true',
+        'callback'            => 'll_pickup_config',
+    ]);
+});
+
+function ll_pickup_config(WP_REST_Request $request) {
+    if (!ll_wc_ready()) {
+        return new WP_REST_Response(['errors' => ['Store unavailable']], 503);
+    }
+
+    $stores = [];
+    foreach (ll_fulfilment_stores() as $i => $store) {
+        if (trim($store['name']) === '') continue; // an unfilled "+ Add store" row isn't a real store yet
+        $stores[] = [
+            'id'           => ll_store_id($store['name'], $i),
+            'name'         => $store['name'],
+            'address'      => $store['address'],
+            'slot_minutes' => (int) $store['slot_minutes'],
+            'slots'        => ll_store_slots($store),
+            'dates'        => ll_store_upcoming_dates($store),
+        ];
+    }
+
+    return new WP_REST_Response([
+        'stores'           => $stores,
+        'delivery_minimum' => ll_minor((float) get_option('ll_delivery_minimum', 0)),
+        'currency'         => ll_currency(),
+    ], 200);
+}
+
+/* -------------------------------------------------------------------------
+ * Fulfilment settings screen — WooCommerce > Fulfilment. Where the bakery
+ * owner sets stores, collection days/hours, blackout dates and the
+ * delivery minimum, all from wp-admin with no code. Hand-rolled POST
+ * handling and HTML rather than the Settings API: the Settings API has no
+ * concept of a repeatable group of fields ("+ Add store"), so building
+ * that on top of it would be more code than this, not less.
+ * ---------------------------------------------------------------------- */
+
+add_action('admin_menu', function () {
+    if (!ll_wc_ready()) return;
+    add_submenu_page(
+        'woocommerce',
+        'Fulfilment',
+        'Fulfilment',
+        'manage_woocommerce',
+        LL_FULFILMENT_PAGE,
+        'll_render_fulfilment_page'
+    );
+});
+
+/**
+ * Handles the settings form before any HTML is sent, so a successful save
+ * can redirect (POST/redirect/GET) instead of leaving a page refresh
+ * resubmit the form — this must run on admin_init, not inside the page
+ * callback itself, which renders too late to redirect cleanly.
+ */
+add_action('admin_init', function () {
+    if (!isset($_POST['ll_fulfilment_nonce'])) return;
+    if (!ll_wc_ready() || !current_user_can('manage_woocommerce')) return;
+    if (!check_admin_referer('ll_save_fulfilment', 'll_fulfilment_nonce')) return;
+
+    $stores = [];
+    foreach ((array) ($_POST['stores'] ?? []) as $raw) {
+        if (!empty($raw['remove'])) continue; // "Remove this store" — dropped on save, not soft-deleted
+        $stores[] = ll_sanitize_store($raw);
+    }
+    if (isset($_POST['ll_add_store'])) {
+        $stores[] = ll_store_defaults([]); // a blank block for the owner to fill in, saved now so a refresh doesn't lose it
+    }
+
+    update_option(LL_FULFILMENT_OPTION, $stores);
+    update_option('ll_delivery_minimum', max(0, (float) ($_POST['ll_delivery_minimum'] ?? 0)));
+
+    wp_safe_redirect(add_query_arg(['page' => LL_FULFILMENT_PAGE, 'updated' => '1'], admin_url('admin.php')));
+    exit;
+});
+
+function ll_sanitize_store($raw) {
+    $raw  = is_array($raw) ? $raw : [];
+    $days = array_values(array_intersect(array_map('intval', (array) ($raw['days'] ?? [])), [0, 1, 2, 3, 4, 5, 6]));
+
+    $blackout = [];
+    foreach (preg_split('/[\r\n,]+/', (string) ($raw['blackout'] ?? '')) as $line) {
+        $line = trim($line);
+        if ($line === '') continue;
+        // createFromFormat is lenient about impossible dates (e.g. silently
+        // rolls 2026-02-30 into March) unless checked with getLastErrors();
+        // round-tripping the parsed date back to a string and comparing is
+        // simpler and equally reliable here.
+        $d = DateTime::createFromFormat('Y-m-d', $line);
+        if ($d && $d->format('Y-m-d') === $line) $blackout[] = $line;
+    }
+
+    return [
+        'name'         => sanitize_text_field((string) ($raw['name'] ?? '')),
+        'address'      => sanitize_text_field((string) ($raw['address'] ?? '')),
+        'days'         => $days,
+        'start'        => ll_sanitize_time($raw['start'] ?? ''),
+        'end'          => ll_sanitize_time($raw['end'] ?? ''),
+        'slot_minutes' => max(5, min(240, (int) ($raw['slot_minutes'] ?? 30))),
+        'blackout'     => $blackout,
+        'weeks_ahead'  => max(1, min(52, (int) ($raw['weeks_ahead'] ?? 4))),
+    ];
+}
+
+function ll_sanitize_time($value) {
+    $value = (string) $value;
+    return preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $value) ? $value : '';
+}
+
+function ll_render_fulfilment_page() {
+    if (!ll_wc_ready() || !current_user_can('manage_woocommerce')) return;
+
+    $stores = ll_fulfilment_stores();
+    if (!$stores) $stores = [ll_store_defaults([])]; // never show a blank page — give the owner one block to fill in
+    $minimum = (float) get_option('ll_delivery_minimum', 0);
+    $labels  = ll_weekday_labels();
+    ?>
+    <div class="wrap">
+        <h1>Fulfilment</h1>
+        <?php if (isset($_GET['updated'])) : ?>
+            <div class="notice notice-success is-dismissible"><p>Saved.</p></div>
+        <?php endif; ?>
+        <p>Set up where and when customers can pick up their order, and the minimum order size for delivery.</p>
+
+        <form method="post">
+            <?php wp_nonce_field('ll_save_fulfilment', 'll_fulfilment_nonce'); ?>
+            <?php submit_button('Save changes'); // also here, not just at the bottom, so pressing Enter in a text field saves rather than triggering "+ Add store" below ?>
+
+            <?php foreach ($stores as $i => $store) : ?>
+                <h2 style="margin-top:2em;"><?php echo $store['name'] !== '' ? esc_html($store['name']) : 'New store'; ?></h2>
+                <table class="form-table" role="presentation">
+                    <tr>
+                        <th><label for="ll-name-<?php echo (int) $i; ?>">Store name</label></th>
+                        <td><input type="text" id="ll-name-<?php echo (int) $i; ?>" name="stores[<?php echo (int) $i; ?>][name]" value="<?php echo esc_attr($store['name']); ?>" class="regular-text"></td>
+                    </tr>
+                    <tr>
+                        <th><label for="ll-address-<?php echo (int) $i; ?>">Address</label></th>
+                        <td><input type="text" id="ll-address-<?php echo (int) $i; ?>" name="stores[<?php echo (int) $i; ?>][address]" value="<?php echo esc_attr($store['address']); ?>" class="regular-text"></td>
+                    </tr>
+                    <tr>
+                        <th>Collection days</th>
+                        <td>
+                            <?php foreach ($labels as $num => $label) : ?>
+                                <label style="margin-right:12px; display:inline-block;">
+                                    <input type="checkbox" name="stores[<?php echo (int) $i; ?>][days][]" value="<?php echo (int) $num; ?>" <?php checked(in_array($num, $store['days'], true)); ?>>
+                                    <?php echo esc_html($label); ?>
+                                </label>
+                            <?php endforeach; ?>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><label for="ll-start-<?php echo (int) $i; ?>">Collection hours</label></th>
+                        <td>
+                            From <input type="time" id="ll-start-<?php echo (int) $i; ?>" name="stores[<?php echo (int) $i; ?>][start]" value="<?php echo esc_attr($store['start']); ?>">
+                            to <input type="time" name="stores[<?php echo (int) $i; ?>][end]" value="<?php echo esc_attr($store['end']); ?>">
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><label for="ll-slot-<?php echo (int) $i; ?>">Slot length</label></th>
+                        <td><input type="number" id="ll-slot-<?php echo (int) $i; ?>" name="stores[<?php echo (int) $i; ?>][slot_minutes]" value="<?php echo esc_attr($store['slot_minutes']); ?>" min="5" max="240" step="5" class="small-text"> minutes</td>
+                    </tr>
+                    <tr>
+                        <th><label for="ll-blackout-<?php echo (int) $i; ?>">Blackout dates</label></th>
+                        <td>
+                            <textarea id="ll-blackout-<?php echo (int) $i; ?>" name="stores[<?php echo (int) $i; ?>][blackout]" rows="3" class="regular-text" placeholder="2026-12-25, 2026-12-26"><?php echo esc_textarea(implode(', ', $store['blackout'])); ?></textarea>
+                            <p class="description">One date per line or comma-separated, format YYYY-MM-DD. No pickups are offered on these dates.</p>
+                        </td>
+                    </tr>
+                    <tr>
+                        <th><label for="ll-weeks-<?php echo (int) $i; ?>">Show the next</label></th>
+                        <td><input type="number" id="ll-weeks-<?php echo (int) $i; ?>" name="stores[<?php echo (int) $i; ?>][weeks_ahead]" value="<?php echo esc_attr($store['weeks_ahead']); ?>" min="1" max="52" class="small-text"> weeks</td>
+                    </tr>
+                    <tr>
+                        <th></th>
+                        <td><label><input type="checkbox" name="stores[<?php echo (int) $i; ?>][remove]" value="1"> Remove this store</label></td>
+                    </tr>
+                </table>
+            <?php endforeach; ?>
+
+            <p><button type="submit" name="ll_add_store" value="1" class="button">+ Add store</button></p>
+
+            <h2>Delivery</h2>
+            <table class="form-table" role="presentation">
+                <tr>
+                    <th><label for="ll-delivery-minimum">Minimum order for delivery</label></th>
+                    <td>
+                        <?php echo esc_html(get_woocommerce_currency_symbol()); ?>
+                        <input type="number" id="ll-delivery-minimum" name="ll_delivery_minimum" value="<?php echo esc_attr($minimum); ?>" min="0" step="0.01" class="small-text">
+                        <p class="description">Orders below this can't check out with delivery. Leave at 0 for no minimum.</p>
+                    </td>
+                </tr>
+            </table>
+
+            <?php submit_button('Save changes'); ?>
+        </form>
+    </div>
+    <?php
+}
+
+/* -------------------------------------------------------------------------
  * Checkout handoff — turns the browser's cart into a real WooCommerce order.
  * Runs on admin_post_ll_handoff / admin_post_nopriv_ll_handoff, a genuine
  * top-level browser form POST (see Task 9's checkout.js), never an XHR — so
@@ -604,6 +972,30 @@ function ll_handoff() {
         ll_reject($fulfilment === 'delivery' ? 'out_of_area' : 'unavailable', $origin);
     }
 
+    // 9b. Validate the pickup slot itself. ll_apply_fulfilment() above only
+    // confirmed local_pickup is a valid shipping method for *some* store —
+    // it has no idea whether this store/date/time combination is one the
+    // bakery actually offers. Same principle as re-pricing every line: the
+    // client's slot choice is a request, not an instruction. Checked with
+    // the same functions the public /pickup endpoint uses to generate the
+    // slot list in the first place, so nothing can drift between "what we
+    // offered" and "what we'll accept".
+    if ($fulfilment === 'pickup') {
+        $pickup_store = ll_post_field('pickup_store');
+        $pickup_date  = ll_post_field('pickup_date');
+        $pickup_slot  = ll_post_field('pickup_slot');
+        if (!ll_pickup_slot_valid($pickup_store, $pickup_date, $pickup_slot)) {
+            ll_reject('bad_slot', $origin);
+        }
+        // Resolved once here and reused at step 12 below, so the order (and
+        // the confirmation emails built from it) always show the store's
+        // actual configured name — never whatever raw value the client sent
+        // as pickup_store, which ll_find_store() deliberately also accepts
+        // as a slug/id (see its own comment) and would otherwise leak
+        // straight onto a customer-facing email looking like "orange-county-store".
+        $pickup_store_name = ll_find_store($pickup_store)['name'] ?? $pickup_store;
+    }
+
     WC()->cart->calculate_totals();
 
     // 10. Delivery minimum, same option /quote reads.
@@ -656,9 +1048,9 @@ function ll_handoff() {
     WC()->session->set('ll_from_handoff', true);
     WC()->session->set('ll_origin', $origin);
     WC()->session->set('ll_pickup', $fulfilment === 'pickup' ? [
-        'store' => ll_post_field('pickup_store'),
-        'date'  => ll_post_field('pickup_date'),
-        'slot'  => ll_post_field('pickup_slot'),
+        'store' => $pickup_store_name,
+        'date'  => $pickup_date,
+        'slot'  => $pickup_slot,
     ] : null);
 
     // 13. Hand off to WooCommerce's own checkout.
