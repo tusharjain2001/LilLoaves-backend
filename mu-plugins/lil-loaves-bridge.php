@@ -1130,3 +1130,246 @@ add_action('woocommerce_admin_order_data_after_shipping_address', function ($ord
         . esc_html($order->get_meta('_ll_pickup_date')) . ' ' . esc_html($order->get_meta('_ll_pickup_slot'))
         . '</p>';
 });
+
+/* -------------------------------------------------------------------------
+ * Branded confirmation emails — WooCommerce already sends both required
+ * emails (customer + bakery) with zero code; this section only changes how
+ * they look and adds the fulfilment-specific content the design calls for.
+ *
+ * Colour and the personalised heading use WooCommerce's own, already
+ * wp-admin-editable email settings (WooCommerce > Settings > Emails) via
+ * the standard filters it exposes for exactly this — set once via WP-CLI
+ * (see the README) rather than a template override, so the bakery can
+ * still retune them later from wp-admin without touching this file.
+ *
+ * Deliberately NOT a full email-header.php/email-footer.php template
+ * override, even though that's the more common way to reskin WooCommerce
+ * emails. Checked against this store's actual WooCommerce 11.0.0 source:
+ * WC_Emails::email_header()/email_footer() are hooked with the default
+ * accepted_args of 1, so the $email object (needed to reach the order for
+ * a personalised "Thank You, {name}") never actually reaches those two
+ * templates even though do_action() is called with it — only $email_heading
+ * does. The heading filter below receives the order directly, no override
+ * needed. A full template override would also have to reproduce WC's
+ * email_improvements feature-flag branching (header image, RTL, font
+ * option) to avoid regressing anything neither this store nor this brief
+ * asked to change.
+ *
+ * No flexbox anywhere below — WooCommerce's own order table is already
+ * built on tables for Outlook, and every custom block here follows suit.
+ * No custom @font-face either — Ligema/Parkinsans/Pacifico do not load in
+ * Gmail or Outlook, so naming them first in a font stack (system fonts as
+ * the fallback that actually renders) costs nothing and is honest about
+ * what a subscriber will really see; see the README for the colour/curve
+ * choices that carry the brand instead.
+ * ---------------------------------------------------------------------- */
+
+/**
+ * "Pick Up Confirmed! Thank You, {first name}!" / "Order Confirmed! Thank
+ * You, {first name}!" — the two customer order-status emails this store's
+ * Cash on Delivery gateway actually triggers (COD sets non-downloadable
+ * orders to "processing" — verified in WC_Gateway_COD::process_payment).
+ * customer_on_hold_order is filtered too in case that ever changes (e.g. a
+ * downloadable product gets added, which flips COD's default status).
+ */
+add_filter('woocommerce_email_heading_customer_processing_order', 'll_customer_email_heading', 10, 2);
+add_filter('woocommerce_email_heading_customer_on_hold_order', 'll_customer_email_heading', 10, 2);
+add_filter('woocommerce_email_heading_customer_completed_order', 'll_customer_email_heading', 10, 2);
+
+function ll_customer_email_heading($heading, $order) {
+    if (!($order instanceof WC_Order)) return $heading; // WooCommerce only ever calls this filter with an order for order emails, but never trust a filter's arg shape blindly
+    $verb = ll_order_is_pickup($order) ? 'Pick Up Confirmed' : 'Order Confirmed';
+    $name = trim($order->get_billing_first_name());
+    return $name !== '' ? sprintf('%s! Thank You, %s!', $verb, $name) : $verb . '!';
+}
+
+/** The bakery's own heading names who ordered and how they're collecting it, so it's scannable from an inbox list without opening the email. */
+add_filter('woocommerce_email_heading_new_order', function ($heading, $order) {
+    if (!($order instanceof WC_Order)) return $heading;
+    $mode = ll_order_is_pickup($order) ? 'Pickup' : 'Delivery';
+    $name = trim($order->get_formatted_billing_full_name());
+    return $name !== '' ? sprintf('New %s Order \xe2\x80\x94 %s', $mode, $name) : sprintf('New %s Order', $mode);
+}, 10, 2);
+
+/**
+ * Whether an order is pickup or delivery, read from the order's own
+ * shipping line rather than our _ll_pickup_store meta — that meta only
+ * exists on orders that came through ll_handoff, but this must also give a
+ * sane answer for an order placed any other way (e.g. created directly in
+ * wp-admin), so it reads the same signal ll_apply_fulfilment() chose at
+ * checkout time: which shipping method actually ended up on the order.
+ */
+function ll_order_is_pickup($order) {
+    foreach ($order->get_shipping_methods() as $item) {
+        if ($item->get_method_id() === 'local_pickup') return true;
+    }
+    return false;
+}
+
+/**
+ * Reformats the canonical values ll_pickup_slot_valid() checks against
+ * (Y-m-d; HH:MM-HH:MM) into something a customer reads naturally. Falls
+ * back to the raw value on anything that doesn't parse rather than hiding
+ * it — an order this old-format-tolerant handoff already accepted should
+ * still show *something*, never a blank field.
+ */
+function ll_format_pickup_date($date) {
+    $d = DateTime::createFromFormat('Y-m-d', $date, wp_timezone());
+    return ($d && $d->format('Y-m-d') === $date) ? $d->format('j M, l') : $date;
+}
+
+function ll_format_pickup_slot($slot) {
+    if (!preg_match('/^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/', $slot, $m)) return $slot;
+    $tz = wp_timezone();
+    $s  = DateTime::createFromFormat('H:i', $m[1] . ':' . $m[2], $tz);
+    $e  = DateTime::createFromFormat('H:i', $m[3] . ':' . $m[4], $tz);
+    return ($s && $e) ? $s->format('g:i A') . ' - ' . $e->format('g:i A') : $slot;
+}
+
+/**
+ * Extra CSS layered on top of WooCommerce's own generated stylesheet via
+ * the filter it already exposes for this. WC_Email::style_inline() runs the
+ * combined result through Emogrifier before sending, so these rules end up
+ * inlined on the actual elements exactly like WooCommerce's own — no
+ * separate inlining step needed here. Only touches classes this file itself
+ * emits (ll-*), never WooCommerce's own selectors, so a bakery owner who
+ * later retunes the colours in WooCommerce > Settings > Emails keeps
+ * working exactly as they would without this filter.
+ */
+add_filter('woocommerce_email_styles', function ($css) {
+    return $css . '
+        .ll-card { background: #f9f1db; border-radius: 16px; padding: 16px 20px; }
+        .ll-card-title { font-family: Georgia, "Times New Roman", serif; text-transform: uppercase; letter-spacing: 0.5px; color: #57423d; font-size: 14px; margin: 0 0 8px; }
+        .ll-pill { display: inline-block; background: #f4e4b7; border-radius: 16px; padding: 6px 16px; color: #57423d; font-weight: bold; font-size: 14px; }
+        .ll-muted { color: #8a7368; font-size: 12px; }
+    ';
+});
+
+/**
+ * The one piece of content with no native WooCommerce equivalent: fulfilment
+ * details (pickup slot / delivery note for the customer, a scannable
+ * fulfilment+contact summary for the bakery). Hooked before the order table
+ * — on every email template that has one, HTML and plain-text alike, see
+ * WC's emails/email-order-details.php and emails/plain/email-order-details.php
+ * — and restricted to the email ids this actually applies to, so it never
+ * renders on e.g. a refund or cancellation notice where "Pick Up Confirmed"
+ * would be actively wrong.
+ */
+add_action('woocommerce_email_before_order_table', 'll_email_fulfilment_block', 20, 4);
+
+function ll_email_fulfilment_block($order, $sent_to_admin, $plain_text, $email) {
+    if (!($order instanceof WC_Order)) return;
+    $relevant = ['customer_processing_order', 'customer_on_hold_order', 'customer_completed_order', 'new_order'];
+    if (!is_object($email) || !in_array($email->id, $relevant, true)) return;
+
+    $pickup = ll_order_is_pickup($order);
+
+    if ($sent_to_admin) {
+        ll_email_admin_fulfilment_block($order, $pickup, $plain_text);
+        return;
+    }
+
+    if ($pickup) {
+        ll_email_pickup_block($order, $plain_text);
+    } else {
+        ll_email_delivery_block($order, $plain_text);
+    }
+}
+
+/** What the bakery works from: fulfilment method, pickup slot if any, and how to reach the customer — all in one place, before they scroll to the line items. */
+function ll_email_admin_fulfilment_block($order, $pickup, $plain_text) {
+    $store = trim((string) $order->get_meta('_ll_pickup_store'));
+    $date  = trim((string) $order->get_meta('_ll_pickup_date'));
+    $slot  = trim((string) $order->get_meta('_ll_pickup_slot'));
+
+    $contact_parts = array_filter([$order->get_billing_phone(), $order->get_billing_email()]);
+    $contact       = implode(' \xc2\xb7 ', $contact_parts);
+
+    if ($plain_text) {
+        echo "Fulfilment: " . ($pickup ? 'Pickup' : 'Delivery') . "\n";
+        if ($pickup && $store !== '') {
+            echo 'Store: ' . $store . "\n";
+            if ($date !== '') echo 'Date: ' . ll_format_pickup_date($date) . "\n";
+            if ($slot !== '') echo 'Time: ' . ll_format_pickup_slot($slot) . "\n";
+        }
+        if ($contact !== '') echo "Contact: {$contact}\n";
+        echo "\n";
+        return;
+    }
+    ?>
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="margin-bottom:16px;">
+        <tr><td class="ll-card">
+            <p class="ll-card-title" style="margin:0 0 8px;"><?php echo $pickup ? 'Pickup order' : 'Delivery order'; ?></p>
+            <?php if ($pickup && $store !== '') : ?>
+                <p style="margin:0 0 4px;">
+                    <strong><?php echo esc_html($store); ?></strong>
+                    <?php if ($date !== '') : ?> &mdash; <?php echo esc_html(ll_format_pickup_date($date)); ?><?php endif; ?>
+                    <?php if ($slot !== '') : ?> <?php echo esc_html(ll_format_pickup_slot($slot)); ?><?php endif; ?>
+                </p>
+            <?php endif; ?>
+            <?php if ($contact !== '') : ?>
+                <p class="ll-muted" style="margin:0;">Contact: <?php echo esc_html($contact); ?></p>
+            <?php endif; ?>
+        </td></tr>
+    </table>
+    <?php
+}
+
+/** Customer's pickup confirmation — store, date, slot, and the "bring your order number" reminder from the Figma reference. */
+function ll_email_pickup_block($order, $plain_text) {
+    $store = trim((string) $order->get_meta('_ll_pickup_store'));
+    $date  = trim((string) $order->get_meta('_ll_pickup_date'));
+    $slot  = trim((string) $order->get_meta('_ll_pickup_slot'));
+
+    if ($plain_text) {
+        echo "Pickup Details\n";
+        if ($store !== '') echo $store . "\n";
+        if ($date !== '') echo 'Date: ' . ll_format_pickup_date($date) . "\n";
+        if ($slot !== '') echo 'Time: ' . ll_format_pickup_slot($slot) . "\n";
+        echo "\nBefore you arrive: please bring your order confirmation or order number when collecting your order.\n\n";
+        return;
+    }
+    ?>
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="margin-bottom:16px;">
+        <tr><td class="ll-card" style="text-align:center;">
+            <p class="ll-card-title">Pickup Details</p>
+            <?php if ($store !== '') : ?><p style="margin:0 0 12px;font-weight:600;color:#57423d;"><?php echo esc_html($store); ?></p><?php endif; ?>
+            <table cellpadding="0" cellspacing="0" role="presentation" style="margin:0 auto;">
+                <tr>
+                    <?php if ($date !== '') : ?><td style="padding:0 8px;"><span class="ll-pill"><?php echo esc_html(ll_format_pickup_date($date)); ?></span></td><?php endif; ?>
+                    <?php if ($slot !== '') : ?><td style="padding:0 8px;"><span class="ll-pill"><?php echo esc_html(ll_format_pickup_slot($slot)); ?></span></td><?php endif; ?>
+                </tr>
+            </table>
+        </td></tr>
+    </table>
+    <p class="ll-muted" style="text-align:center;">Before you arrive: please bring your order confirmation or order number when collecting your order.</p>
+    <?php
+}
+
+/**
+ * Customer's delivery confirmation — the address, and the "next delivery
+ * run" framing the design spec settled on: delivery orders don't pick a
+ * date in v1 (see the commerce-layer spec's "Delivery orders do not select
+ * a date" decision), so this states that plainly rather than implying a
+ * schedule that doesn't exist.
+ */
+function ll_email_delivery_block($order, $plain_text) {
+    $address = $order->get_formatted_shipping_address();
+    if (!$address) $address = $order->get_formatted_billing_address();
+
+    if ($plain_text) {
+        echo "Delivery Details\n";
+        echo wp_strip_all_tags((string) $address) . "\n";
+        echo "\nWe'll deliver on our next delivery run and be in touch if that changes.\n\n";
+        return;
+    }
+    ?>
+    <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="margin-bottom:16px;">
+        <tr><td class="ll-card" style="text-align:center;">
+            <p class="ll-card-title">Delivery Details</p>
+            <address style="font-style:normal;margin:0;color:#57423d;"><?php echo wp_kses_post((string) $address); ?></address>
+        </td></tr>
+    </table>
+    <p class="ll-muted" style="text-align:center;">We'll deliver on our next delivery run and be in touch if that changes.</p>
+    <?php
+}

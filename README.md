@@ -435,3 +435,89 @@ store's literal name (`"Orange County Store"`), not a slug.
 No per-slot capacity — deliberately out of scope (avoids a reservation race
 at checkout), same as `/quote`.
 
+## Branded confirmation emails
+
+WooCommerce sends the customer and bakery emails with zero code — this only
+changes how they look and adds fulfilment content, via three mechanisms
+layered on top of stock WooCommerce, not a template override:
+
+1. **Colour and personalised heading use WooCommerce's own, already
+   wp-admin-editable email settings** (`WooCommerce > Settings > Emails`),
+   set once via WP-CLI rather than hardcoded, so the bakery can retune them
+   later without touching code:
+   ```bash
+   ssh lilloaves-wp "wp option update woocommerce_email_base_color '#57423d'"
+   ssh lilloaves-wp "wp option update woocommerce_email_background_color '#fbfbf8'"
+   ssh lilloaves-wp "wp option update woocommerce_email_body_background_color '#fffefb'"
+   ssh lilloaves-wp "wp option update woocommerce_email_text_color '#57423d'"
+   ssh lilloaves-wp "wp option update woocommerce_email_footer_text_color '#57423d'"
+   ssh lilloaves-wp "wp option update woocommerce_email_from_name \"Lil' Loaves\""
+   ssh lilloaves-wp "wp option update woocommerce_email_footer_text '🧡 The Lil'\'' Loaves Family — From our table to yours, one hand-shaped loaf at a time.'"
+   ```
+   The heading itself ("Pick Up Confirmed! Thank You, Manan!" /
+   "Order Confirmed! Thank You, Manan!" / bakery-side "New Pickup Order —
+   Manan Utsav") comes from `woocommerce_email_heading_{email_id}` filters
+   in the plugin — WooCommerce's own, documented extension point, not a
+   template override.
+2. **`woocommerce_email_styles` filter** appends `.ll-card`/`.ll-pill`/
+   `.ll-muted` CSS (scalloped card, pill badge, muted caption — the Figma
+   reference's visual language) on top of WooCommerce's generated
+   stylesheet. `WC_Email::style_inline()` runs the combined CSS through
+   Emogrifier before sending, so these rules end up inlined exactly like
+   WooCommerce's own — required for Outlook, which ignores `<style>` blocks.
+   Fonts declare Ligema/Parkinsans/Georgia first and a system stack after —
+   Gmail and Outlook strip custom `@font-face`, so only the fallback ever
+   actually renders; this is honest about that rather than pretending
+   otherwise.
+3. **`woocommerce_email_before_order_table` action** — the one piece with no
+   native WooCommerce equivalent — adds the fulfilment content itself,
+   branching on `sent_to_admin` and on whether the order's shipping line is
+   `local_pickup` (`ll_order_is_pickup()`, read from the order's own
+   shipping item, not `_ll_pickup_store` meta, so it gives a sane answer for
+   an order placed any way other than `ll_handoff` too):
+   - **Customer, pickup**: store name, date, time slot as pill badges, "bring
+     your order confirmation or order number" reminder.
+   - **Customer, delivery**: the shipping address, and a note that it ships
+     on the bakery's next delivery run (the commerce-layer spec's decision —
+     delivery orders don't pick a date in v1).
+   - **Bakery (`new_order`)**: fulfilment method, store/date/slot if pickup,
+     and a `Contact: phone · email` line, all before the line-item table so
+     it's the first thing staff see.
+   Restricted to `customer_processing_order`, `customer_on_hold_order`,
+   `customer_completed_order` and `new_order` — never refund/cancellation/
+   failed notices, where "Pick Up Confirmed!" would be actively wrong.
+   Handles both the HTML and plain-text templates (both fire the same hook).
+
+Also fixed while wiring this up: Cash on Delivery's own instructions text
+defaulted to "Pay with cash upon delivery," which reads as wrong on a pickup
+order —
+```bash
+ssh lilloaves-wp "wp option update woocommerce_cod_settings '{\"enabled\":\"yes\",\"title\":\"Pay at pickup \/ on delivery\",\"instructions\":\"Pay in cash when you collect your order, or when it'\''s delivered.\"}' --format=json"
+```
+
+**Verified against this store's actual WooCommerce 11.0.0 source, not
+assumed**: `WC_Emails::email_header()`/`email_footer()` are hooked with the
+default `accepted_args` of `1`, so despite `do_action('woocommerce_email_header',
+$email_heading, $email)` being called with two arguments, the `$email`
+object never actually reaches `emails/email-header.php` — only
+`$email_heading` does. A full template override would have been needed to
+reach the order for personalisation; the heading filter above receives the
+order directly instead, which is why this doesn't use one.
+
+**Cash on Delivery order status**: COD's own `process_payment()` sets a
+non-downloadable order to `processing`, not `on-hold` (verified: both real
+test orders below landed on `processing`). `ll_order_is_pickup()` and the
+heading filters are wired to `customer_on_hold_order` too, in case that ever
+changes (e.g. a downloadable product gets added, which flips COD's default).
+
+**Verified live**: placed one real pickup order (Sour Dough, `local_pickup`
+$0, total $21.13) and one real delivery order (Danish Pastries, `flat_rate`
+$5, total $28.00) via the actual Store API checkout endpoint (COD), using
+the same cookie session a real `ll_handoff` redirect produces. Both orders'
+`_new_order_email_sent` meta was `true` after checkout — WooCommerce's own
+anti-duplicate guard, and proof the real admin email genuinely sent, not
+just that its content renders. The customer email was independently
+confirmed sent via a `wp_mail_succeeded` hook. Rendered HTML (post-Emogrifier,
+the literal bytes handed to `wp_mail()`) saved for all four
+pickup/delivery × customer/admin combinations; both test orders deleted
+afterward. See the plan report for specifics and file locations.
