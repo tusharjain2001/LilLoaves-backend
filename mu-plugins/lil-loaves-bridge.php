@@ -644,6 +644,32 @@ function ll_sanitize_time($value) {
     return preg_match('/^([01]\d|2[0-3]):[0-5]\d$/', $value) ? $value : '';
 }
 
+/**
+ * Catches a store that would silently offer nothing, the moment it's saved
+ * — not later, from a customer finding an empty date/time picker. Checks
+ * the same two conditions ll_store_upcoming_dates()/ll_store_slots() already
+ * fail safe on (no days selected; start not before end) directly, rather
+ * than calling those and inferring the cause back out of an empty array —
+ * that would tell the owner *that* something's wrong but not *what*, which
+ * isn't "plain and obvious" for someone who isn't a developer. Silent on a
+ * still-blank "+ Add store" row (no name yet): that's not misconfigured,
+ * it's just not filled in yet.
+ */
+function ll_store_warnings($store) {
+    if (trim($store['name']) === '') return [];
+
+    $warnings = [];
+    if (!$store['days']) {
+        $warnings[] = 'No collection days are selected — customers will not be offered any pickup dates for this store.';
+    }
+    if ($store['start'] === '' || $store['end'] === '') {
+        $warnings[] = 'Collection hours are incomplete — customers will not be offered any pickup times for this store.';
+    } elseif ($store['start'] >= $store['end']) {
+        $warnings[] = 'Collection end time is not after the start time — customers will not be offered any pickup times for this store.';
+    }
+    return $warnings;
+}
+
 function ll_render_fulfilment_page() {
     if (!ll_wc_ready() || !current_user_can('manage_woocommerce')) return;
 
@@ -665,6 +691,9 @@ function ll_render_fulfilment_page() {
 
             <?php foreach ($stores as $i => $store) : ?>
                 <h2 style="margin-top:2em;"><?php echo $store['name'] !== '' ? esc_html($store['name']) : 'New store'; ?></h2>
+                <?php foreach (ll_store_warnings($store) as $warning) : ?>
+                    <div class="notice notice-warning inline"><p><?php echo esc_html($warning); ?></p></div>
+                <?php endforeach; ?>
                 <table class="form-table" role="presentation">
                     <tr>
                         <th><label for="ll-name-<?php echo (int) $i; ?>">Store name</label></th>
@@ -1158,9 +1187,12 @@ add_action('woocommerce_admin_order_data_after_shipping_address', function ($ord
  * No flexbox anywhere below — WooCommerce's own order table is already
  * built on tables for Outlook, and every custom block here follows suit.
  * No custom @font-face either — Ligema/Parkinsans/Pacifico do not load in
- * Gmail or Outlook, so naming them first in a font stack (system fonts as
- * the fallback that actually renders) costs nothing and is honest about
- * what a subscriber will really see; see the README for the colour/curve
+ * Gmail or Outlook, so this doesn't name them at all: body copy uses
+ * WooCommerce's own font setting/stack unchanged, and the one place this
+ * file sets a font-family (.ll-card-title, for the "PICKUP DETAILS"-style
+ * small caps label) goes straight to a serif system stack (Georgia/Times
+ * New Roman) as a deliberate substitute for Ligema's display feel, not a
+ * disguised attempt at the real thing. See the README for the colour/curve
  * choices that carry the brand instead.
  * ---------------------------------------------------------------------- */
 
@@ -1188,7 +1220,7 @@ add_filter('woocommerce_email_heading_new_order', function ($heading, $order) {
     if (!($order instanceof WC_Order)) return $heading;
     $mode = ll_order_is_pickup($order) ? 'Pickup' : 'Delivery';
     $name = trim($order->get_formatted_billing_full_name());
-    return $name !== '' ? sprintf('New %s Order \xe2\x80\x94 %s', $mode, $name) : sprintf('New %s Order', $mode);
+    return $name !== '' ? sprintf('New %s Order — %s', $mode, $name) : sprintf('New %s Order', $mode);
 }, 10, 2);
 
 /**
@@ -1283,7 +1315,7 @@ function ll_email_admin_fulfilment_block($order, $pickup, $plain_text) {
     $slot  = trim((string) $order->get_meta('_ll_pickup_slot'));
 
     $contact_parts = array_filter([$order->get_billing_phone(), $order->get_billing_email()]);
-    $contact       = implode(' \xc2\xb7 ', $contact_parts);
+    $contact       = implode(' · ', $contact_parts);
 
     if ($plain_text) {
         echo "Fulfilment: " . ($pickup ? 'Pickup' : 'Delivery') . "\n";
