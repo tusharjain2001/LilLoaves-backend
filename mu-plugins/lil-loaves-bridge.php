@@ -1405,3 +1405,192 @@ function ll_email_delivery_block($order, $plain_text) {
     <p class="ll-muted" style="text-align:center;">We'll deliver on our next delivery run and be in touch if that changes.</p>
     <?php
 }
+
+/* -------------------------------------------------------------------------
+ * Checkout branding — without this, a customer clicks "Proceed to Checkout"
+ * on the React storefront and lands on a bare WordPress.com page in a
+ * different typeface and palette, right as they're deciding whether to
+ * trust the site with money. This re-skins colour, spacing and shape only;
+ * every field, validation message and payment option is left completely
+ * alone, so nothing here can break checkout.
+ *
+ * Confirmed live (wp eval against the checkout page's post_content) that
+ * this store renders the block/Store API checkout — wc-block-checkout,
+ * wp-block-woocommerce-checkout-*, wc-block-components-* — never the
+ * classic shortcode markup (#customer_details and friends). Same family
+ * this file already had to get right for the create-order hook and the
+ * post-payment redirect further up; the selectors below target only that
+ * family.
+ *
+ * No custom fonts shipped. Two reasons, not one: (1) Parkinsans is an
+ * ordinary-weight geometric sans close enough to a system stack that a
+ * fallback reads as "the same bakery" without another network request on
+ * the one page where a customer is about to pay; (2) Ligema DEMO — the
+ * frontend's display face — is licensed free for personal use only per
+ * its own LICENSE file in that repo, with a commercial licence explicitly
+ * "required before this goes live." Shipping it to a second, publicly
+ * served property is a licensing decision this plugin has no business
+ * making unilaterally. A system stack still carries the palette, radius
+ * and button shape; that is enough to read as the same brand.
+ *
+ * is_checkout() covers both the checkout page and the order-received
+ * endpoint (verified against WooCommerce core: it's is_page(checkout) OR
+ * is_wc_endpoint_url('order-pay'/'order-received')), so one guard styles
+ * both without a second hook — even though this store's own handoff orders
+ * never actually stop on WooCommerce's order-received page (they're sent
+ * straight to the storefront's /order-confirmed, see the redirect filter
+ * above), an order placed some other way still could.
+ */
+add_action('wp_enqueue_scripts', function () {
+    if (!function_exists('is_checkout') || is_admin() || !is_checkout()) return;
+    // false src + wp_add_inline_style is the standard no-file way to hand
+    // WordPress a page-scoped stylesheet; register_style still requires a
+    // handle to attach the inline block to, even with nothing to fetch.
+    wp_register_style('ll-checkout', false, [], '1.0');
+    wp_enqueue_style('ll-checkout');
+    wp_add_inline_style('ll-checkout', ll_checkout_css());
+});
+
+function ll_checkout_css() {
+    // Brand tokens, copied from the frontend's src/index.css @theme block —
+    // duplicated, not shared, because this plugin and that Vite build have
+    // no common place to import a token file from at PHP-runtime.
+    return '
+        body.woocommerce-checkout, body.woocommerce-order-received {
+            background: #fcf7ea;
+        }
+        .wc-block-components-sidebar-layout.wc-block-checkout {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            color: #57423d;
+            max-width: 1180px;
+            margin: 0 auto;
+            padding: 32px 16px 64px;
+        }
+        .wc-block-components-checkout-step__title,
+        .wc-block-components-checkout-order-summary__title-text,
+        .wc-block-components-title {
+            color: #57423d;
+            font-weight: 600;
+        }
+        /* Each step reads as a panel, matching the React cart page (rounded
+           border, soft fill) instead of a bare list of fieldsets. */
+        .wc-block-components-checkout-step {
+            background: #f7f5f1;
+            border: 1px solid #d8cbbe;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 16px;
+        }
+        .wc-block-checkout__guest-checkout-notice { color: #958175; }
+        .wc-block-components-text-input input,
+        .wc-blocks-components-select__select {
+            border: 1px solid #e9dccf;
+            border-radius: 10px;
+            background: #fdfcf8;
+            color: #57423d;
+        }
+        .wc-block-components-text-input input:focus,
+        .wc-blocks-components-select__select:focus {
+            border-color: #ab866f;
+            outline: none;
+            box-shadow: 0 0 0 1px #ab866f;
+        }
+        .wc-block-components-text-input label { color: #958175; }
+        .wc-block-components-address-card {
+            background: #fdfcf8;
+            border: 1px solid #e9dccf;
+            border-radius: 10px;
+            padding: 12px 16px;
+        }
+        .wc-block-components-address-card__edit,
+        .wc-block-components-panel__button,
+        .wc-block-checkout__terms a,
+        .wc-block-components-checkout-step a {
+            color: #7a6253;
+        }
+        .wc-block-components-checkbox__input,
+        .wc-block-components-radio-control__input {
+            accent-color: #57423d;
+        }
+        .wc-block-components-checkbox__mark { fill: #57423d; }
+        /* Shipping method / payment method choices, styled as selectable
+           cards rather than bare radio rows - same shape language as the
+           step panels above, just one level down. Deliberately NOT setting
+           padding here: WooCommerce reserves room on this element for its
+           own radio circle via padding-left, and overriding the shorthand
+           blanked that reservation, pulling the circle on top of the first
+           few characters of the label ("Local pickup" rendered as "cal
+           pickup"). Border/radius/background do not touch that reserved
+           space, so they are safe to override alone. No apostrophes in this
+           comment on purpose - this whole function body is a single-quoted
+           PHP string, and a raw apostrophe here ends it early. That exact
+           mistake shipped once already, in a contraction in this very
+           comment, and took the site down with a parse error; do not
+           reintroduce one. */
+        .wc-block-components-radio-control__option {
+            border: 1px solid #d8cbbe;
+            border-radius: 10px;
+            background: #fdfcf8;
+        }
+        .wc-block-components-radio-control__option-checked {
+            border-color: #57423d;
+            background: #f0dcd7;
+        }
+        .wc-block-components-radio-control__label-group,
+        .wc-block-components-payment-method-label {
+            color: #57423d;
+        }
+        /* The one primary call to action on the page — full pill, cocoa fill,
+           same shape as "Proceed to Checkout" on the cart page it follows. */
+        .wc-block-components-checkout-place-order-button {
+            background: #57423d !important;
+            border-color: #57423d !important;
+            border-radius: 100px !important;
+            color: #fff !important;
+            font-weight: 500;
+            padding: 14px 24px !important;
+        }
+        .wc-block-components-checkout-place-order-button:hover:not(:disabled) {
+            background: #7a6253 !important;
+            border-color: #7a6253 !important;
+        }
+        .wc-block-components-checkout-place-order-button:disabled {
+            opacity: .5;
+        }
+        .wc-block-components-sidebar.wc-block-checkout__sidebar {
+            background: #fbfbf8;
+            border: 1px solid #d8cbbe;
+            border-radius: 16px;
+            padding: 24px;
+        }
+        .wc-block-components-order-summary-item__image img,
+        .wc-block-components-order-summary-item__image {
+            border-radius: 8px;
+        }
+        .wc-block-components-order-summary-item__description,
+        .wc-block-components-totals-item__label,
+        .wc-block-components-totals-item__value,
+        .wc-block-components-checkout-order-summary__title-text,
+        .wc-block-formatted-money-amount {
+            color: #57423d;
+        }
+        .wc-block-components-totals-item.wc-block-components-totals-footer-item {
+            border-top: 1px solid #d8cbbe;
+            padding-top: 12px;
+            font-weight: 600;
+        }
+        .wc-block-components-totals-coupon .wc-block-components-button {
+            border-radius: 100px;
+        }
+        @media (max-width: 480px) {
+            .wc-block-components-sidebar-layout.wc-block-checkout {
+                padding: 16px 12px 48px;
+            }
+            .wc-block-components-checkout-step,
+            .wc-block-components-sidebar.wc-block-checkout__sidebar {
+                padding: 16px;
+                border-radius: 12px;
+            }
+        }
+    ';
+}
