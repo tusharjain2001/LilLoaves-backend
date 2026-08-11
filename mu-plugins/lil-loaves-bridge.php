@@ -134,6 +134,32 @@ function ll_secret_ok(WP_REST_Request $request) {
 }
 
 /**
+ * Confirms a variation id genuinely belongs to the given parent and is
+ * purchasable, or returns null. A variation id is a selector the client
+ * sends, never a price — add_to_cart() does not itself check that a
+ * variation id and a parent id actually go together, so without this a
+ * tampered request could pair one product's parent id with a *different*
+ * product's variation id and get priced/added from the wrong variation.
+ * Shared by /quote and the handoff so the two can never disagree about
+ * what counts as a genuine pairing.
+ *
+ * get_children() (every child, not just currently-visible ones) is
+ * deliberate: even a hidden variation must fail this for the right reason
+ * (not purchasable, checked separately by the caller) rather than the
+ * wrong one (falsely "doesn't belong to this product").
+ */
+function ll_validate_variation($parent, $variation_id) {
+    if (!$parent instanceof WC_Product_Variable) return null;
+    if (!in_array($variation_id, $parent->get_children(), true)) return null;
+
+    $variation = wc_get_product($variation_id);
+    if (!$variation instanceof WC_Product_Variation) return null;
+    if (!$variation->is_purchasable()) return null;
+
+    return $variation;
+}
+
+/**
  * Prices a prospective cart without creating an order.
  */
 function ll_quote(WP_REST_Request $request) {
@@ -164,8 +190,9 @@ function ll_quote(WP_REST_Request $request) {
     WC()->cart->empty_cart();
 
     foreach ($items as $item) {
-        $id  = absint($item['id'] ?? 0);
-        $qty = max(1, absint($item['qty'] ?? 1));
+        $id           = absint($item['id'] ?? 0);
+        $qty          = max(1, absint($item['qty'] ?? 1));
+        $variation_id = absint($item['variation_id'] ?? 0);
         if (!$id) continue;
 
         $product = wc_get_product($id);
@@ -173,14 +200,38 @@ function ll_quote(WP_REST_Request $request) {
             $errors[] = 'One of your items is no longer available';
             continue;
         }
-        if (!$product->is_in_stock()) {
-            $errors[] = sprintf('%s is sold out', $product->get_name());
+
+        // A pack size (Muffins/Cookies/Crackers) is a WooCommerce variation,
+        // not a separate product — $id is always the shared parent, and
+        // variation_id, when sent, selects which pack size. ll_validate_variation()
+        // re-derives that pairing from WooCommerce's own data rather than
+        // trusting the client sent them together honestly. Breads carry no
+        // variation_id and fall straight through unchanged.
+        $line_product = $product;
+        if ($variation_id) {
+            $variation = ll_validate_variation($product, $variation_id);
+            if (!$variation) {
+                $errors[] = 'One of your items is no longer available';
+                continue;
+            }
+            $line_product = $variation;
+        }
+
+        if (!$line_product->is_in_stock()) {
+            $errors[] = sprintf('%s is sold out', $line_product->get_name());
             continue;
         }
         // add_to_cart returns false for reasons is_in_stock() does not cover,
-        // such as a managed stock quantity below the requested amount.
-        if (!WC()->cart->add_to_cart($id, $qty)) {
-            $errors[] = sprintf('We could not add %s in that quantity', $product->get_name());
+        // such as a managed stock quantity below the requested amount. The
+        // $variation array (attribute_pa_pack-size => slug, etc.) is what
+        // makes WooCommerce treat this as a genuinely distinct cart line from
+        // any other pack size of the same parent — without it, two different
+        // pack sizes of one product would collide into a single cart line.
+        $added = $variation_id
+            ? WC()->cart->add_to_cart($id, $qty, $variation_id, $line_product->get_variation_attributes())
+            : WC()->cart->add_to_cart($id, $qty);
+        if (!$added) {
+            $errors[] = sprintf('We could not add %s in that quantity', $line_product->get_name());
         }
     }
 
@@ -210,13 +261,22 @@ function ll_quote(WP_REST_Request $request) {
     // visibly fail to sum to the Subtotal row whenever a coupon is applied.
     // The discount is shown on its own row; it must not also be baked into
     // the lines.
+    // Line matching key is (id, variation_id), not id alone. WooCommerce
+    // already keys $cart_item by a hash that folds in variation_id, so two
+    // pack sizes of the same parent product land as two separate entries in
+    // get_cart() with their own independently correct line_subtotal — the
+    // same parent id appearing twice here with different variation_ids is
+    // the expected, correct shape, not a collision to resolve. variation_id
+    // is 0 for a simple product (bread), so (id, 0) is still a stable,
+    // unique key for those lines exactly as before this change.
     $lines = [];
     foreach (WC()->cart->get_cart() as $cart_item) {
         $lines[] = [
-            'id'    => (int) $cart_item['product_id'],
-            'qty'   => (int) $cart_item['quantity'],
-            'total' => ll_minor($cart_item['line_subtotal'] + $cart_item['line_subtotal_tax']),
-            'unit'  => ll_minor($cart_item['data']->get_price()),
+            'id'           => (int) $cart_item['product_id'],
+            'variation_id' => (int) $cart_item['variation_id'],
+            'qty'          => (int) $cart_item['quantity'],
+            'total'        => ll_minor($cart_item['line_subtotal'] + $cart_item['line_subtotal_tax']),
+            'unit'         => ll_minor($cart_item['data']->get_price()),
         ];
     }
 
@@ -364,6 +424,92 @@ function ll_currency() {
 /** WooCommerce works in decimal; the Store API and React work in minor units. */
 function ll_minor($amount) {
     return (int) round(((float) $amount) * (10 ** wc_get_price_decimals()));
+}
+
+/* -------------------------------------------------------------------------
+ * Pack size (variation) prices — the Store API's product list returns each
+ * variable product's attributes/variations but never a per-variation price
+ * (verified live against GET /wc/store/v1/products), and a variation isn't
+ * individually fetchable either (?include=<variation_id> returns empty). So
+ * "Single Cookie $5.00" next to "Box of 6 $20.00" has no source without this
+ * endpoint — and it exists to answer that in one request for every variable
+ * product, not one request per product, which is exactly the per-page
+ * traffic multiplication the Vercel proxy (api/store.js, frontend repo)
+ * exists to collapse away. Modelled on /pickup below: public, no secret (a
+ * price is already public on the product page), read-only, and shaped so
+ * WordPress.com's own edge/CDN can cache it the same way (see /pickup's own
+ * note on that further down).
+ * ---------------------------------------------------------------------- */
+
+add_action('rest_api_init', function () {
+    if (!ll_wc_ready()) return;
+    register_rest_route('lilloaves/v1', '/variations', [
+        'methods'             => 'GET',
+        'permission_callback' => '__return_true', // public, like /pickup — see the section comment above
+        'callback'            => 'll_variations',
+    ]);
+});
+
+function ll_variations(WP_REST_Request $request) {
+    if (!ll_wc_ready()) {
+        return new WP_REST_Response(['errors' => ['Store unavailable']], 503);
+    }
+
+    // Every variation is returned regardless of stock/purchasable status —
+    // same principle as an out-of-stock simple product still appearing on
+    // the storefront (e.g. Japanese Milk Bread): the client needs to render
+    // a sold-out pack size as disabled, not have it silently vanish.
+    $products = [];
+    foreach (wc_get_products(['type' => 'variable', 'limit' => -1, 'status' => 'publish']) as $parent) {
+        $variations = [];
+        foreach ($parent->get_children() as $variation_id) {
+            $variation = wc_get_product($variation_id);
+            if (!$variation instanceof WC_Product_Variation) continue; // a stale/trashed child id
+
+            $term = ll_variation_term($variation);
+            $variations[] = [
+                'id'          => $variation->get_id(),
+                'name'        => $term ? $term->name : $variation->get_name(),
+                'slug'        => $term ? $term->slug : '',
+                'price'       => ll_minor($variation->get_price()),
+                'in_stock'    => $variation->is_in_stock(),
+                'purchasable' => $variation->is_purchasable(),
+            ];
+        }
+        if (!$variations) continue;
+
+        // String-cast key: relying on PHP's "non-sequential-from-0 array
+        // encodes as a JSON object" behaviour would be correct for every
+        // real product id here (WordPress post ids never start at 0), but
+        // casting makes that guaranteed rather than incidental — the whole
+        // point of this shape is a lookup object by parent id, always.
+        $products[(string) $parent->get_id()] = $variations;
+    }
+
+    return new WP_REST_Response([
+        'products' => $products,
+        'currency' => ll_currency(),
+    ], 200);
+}
+
+/**
+ * get_attributes() on a variation gives back a taxonomy term *slug*
+ * ("single-cookie"), not the human label the storefront displays ("Single
+ * Cookie") — that lives on the term itself, one lookup away. Not hardcoded
+ * to pa_pack-size: these products currently vary on exactly one attribute,
+ * so taking whichever attribute the variation actually has means renaming
+ * it (or a future second attribute) needs no code change here. Falls back
+ * to the variation's own formatted name for a non-taxonomy (plain text)
+ * attribute, which get_attributes() returns as a raw value rather than a
+ * slug — there is no term to look up for those.
+ */
+function ll_variation_term($variation) {
+    foreach ($variation->get_attributes() as $taxonomy => $slug) {
+        if (!$slug || !taxonomy_exists($taxonomy)) continue;
+        $term = get_term_by('slug', $slug, $taxonomy);
+        if ($term) return $term;
+    }
+    return null;
 }
 
 /* -------------------------------------------------------------------------
@@ -954,19 +1100,36 @@ function ll_handoff() {
     $items = json_decode((string) ll_post('items'), true);
     if (!is_array($items)) $items = [];
 
-    // 7. Re-price every line from WooCommerce's own product data. Only id
-    // and qty are ever read from the POST — nothing price-shaped a client
-    // could tamper with is ever looked at, let alone trusted.
+    // 7. Re-price every line from WooCommerce's own product data. Only id,
+    // qty and variation_id are ever read from the POST — nothing
+    // price-shaped a client could tamper with is ever looked at, let alone
+    // trusted. variation_id is validated with the exact same
+    // ll_validate_variation() /quote uses, so a pack size that /quote would
+    // have rejected can never sneak through here into a real order.
     foreach ($items as $item) {
-        $id  = absint($item['id'] ?? 0);
-        $qty = max(1, absint($item['qty'] ?? 1));
+        $id           = absint($item['id'] ?? 0);
+        $qty          = max(1, absint($item['qty'] ?? 1));
+        $variation_id = absint($item['variation_id'] ?? 0);
         if (!$id) continue;
 
         $product = wc_get_product($id);
-        if (!$product || $product->get_status() !== 'publish' || !$product->is_purchasable() || !$product->is_in_stock()) {
+        if (!$product || $product->get_status() !== 'publish' || !$product->is_purchasable()) {
             continue; // no response channel to explain why; it just won't be in the cart
         }
-        WC()->cart->add_to_cart($id, $qty);
+
+        $line_product = $product;
+        if ($variation_id) {
+            $variation = ll_validate_variation($product, $variation_id);
+            if (!$variation) continue;
+            $line_product = $variation;
+        }
+        if (!$line_product->is_in_stock()) continue;
+
+        if ($variation_id) {
+            WC()->cart->add_to_cart($id, $qty, $variation_id, $line_product->get_variation_attributes());
+        } else {
+            WC()->cart->add_to_cart($id, $qty);
+        }
     }
 
     if (WC()->cart->is_empty()) {

@@ -18,8 +18,10 @@ WooCommerce.
   a top-level browser form POST to `/wp-admin/admin-post.php` that turns
   that cart into a real WooCommerce order — see further down. Also adds a
   `WooCommerce > Fulfilment` settings screen, a public
-  `GET /wp-json/lilloaves/v1/pickup` read endpoint, and branding for
-  WooCommerce's own confirmation emails — see the matching sections below.
+  `GET /wp-json/lilloaves/v1/pickup` read endpoint, a public
+  `GET /wp-json/lilloaves/v1/variations` read endpoint for pack-size prices,
+  and branding for WooCommerce's own confirmation emails — see the matching
+  sections below.
 - `.env` (gitignored) — WordPress.com site URL, SSH/SFTP access, WooCommerce
   object IDs. Copy `.env.example` to `.env` and fill in locally; never commit
   real values.
@@ -106,16 +108,31 @@ mechanisms onto either endpoint.
 
 ```json
 {
-  "items": [{ "id": 13, "qty": 2 }],
+  "items": [
+    { "id": 13, "qty": 2 },
+    { "id": 88, "qty": 1, "variation_id": 90 }
+  ],
   "fulfilment": "delivery",
   "postcode": "92868",
   "coupon": "LOAF10"
 }
 ```
 
-- `items` — array of `{ id, qty }`. Missing/invalid ids are skipped with an
-  error; an empty or missing array returns a zeroed quote (HTTP 200), not an
-  error.
+- `items` — array of `{ id, qty, variation_id? }`. `id` is always the
+  product id — for a pack size (Muffins/Cookies/Crackers, all WooCommerce
+  *variable* products sharing the `pa_pack-size` attribute) that's the
+  shared **parent** id, never the variation's own id. `variation_id` is
+  optional and selects which pack size; omit it (or send `0`) for a simple
+  product (breads) and the cart line behaves exactly as it did before pack
+  sizes existed. When present, it is validated (`ll_validate_variation()`)
+  to genuinely belong to `id` and be purchasable —
+  `wc_get_product($variation_id)` doesn't itself check that a variation and
+  a parent id were sent together honestly, so a mismatched pair (e.g. `id`
+  from one product, `variation_id` from another) is rejected with the same
+  "no longer available" error as a bad `id`, never silently priced from
+  whichever product the variation actually belongs to. Missing/invalid ids
+  are skipped with an error; an empty or missing array returns a zeroed
+  quote (HTTP 200), not an error.
 - `fulfilment` — `"pickup"` or `"delivery"`; anything else is treated as
   `"delivery"`.
 - `postcode` — used for `"delivery"`; ignored (blanked) for `"pickup"`. Not
@@ -131,13 +148,15 @@ mechanisms onto either endpoint.
 ```json
 {
   "lines": [
-    { "id": 13, "qty": 2, "total": 4226, "unit": 2113 }
+    { "id": 13, "variation_id": 0, "qty": 2, "total": 4226, "unit": 2113 },
+    { "id": 88, "variation_id": 89, "qty": 1, "total": 500, "unit": 500 },
+    { "id": 88, "variation_id": 90, "qty": 1, "total": 2000, "unit": 2000 }
   ],
-  "subtotal": 4226,
+  "subtotal": 6726,
   "delivery": 500,
   "discount": 0,
   "tax": 0,
-  "total": 4726,
+  "total": 7226,
   "currency": {
     "currency_code": "USD",
     "currency_symbol": "$",
@@ -154,6 +173,23 @@ mechanisms onto either endpoint.
 - `lines[].total` is pre-discount (matches `subtotal`'s basis) — the
   discount is shown on its own row, never baked into line items. So
   `Σ lines[].total === subtotal` always holds, coupon or not.
+- **Line matching key is `(id, variation_id)`, not `id` alone.** `id` is
+  the parent product id and stays the same across pack sizes, so `id` alone
+  cannot distinguish "1 × Single Cookie" from "1 × Box of 6" of the same
+  Choco Chip Cookies product — the example above shows exactly that case:
+  two lines, same `id: 88`, different `variation_id`, each independently and
+  correctly priced (`500` and `2000`), summing to the right subtotal.
+  `variation_id` is `0` for a simple product (bread), so `(id, 0)` is still
+  a stable, unique key for those lines exactly as before pack sizes existed
+  — this is not a breaking change to the existing contract, only an added
+  field. WooCommerce itself is the reason this falls out for free: it keys
+  each cart line by a hash that folds in `variation_id`, so two pack sizes
+  of one parent are already two separate entries in `WC()->cart->get_cart()`
+  with their own correct `line_subtotal` — nothing had to be de-duplicated
+  or merged here. The client should key its own cart lines by `(id,
+  variation_id)` the same way when matching a quote line back to a cart
+  line, rather than by `id` and a separately-tracked "selected options"
+  value.
 - `delivery` is 0 in three different situations, only one of which is an
   error: pickup (always 0, no error); a delivery quote with no postcode
   entered yet (0, no error — the cart's normal starting state); and a
@@ -173,6 +209,90 @@ mechanisms onto either endpoint.
 client (identified by the `X-LL-Client` header the Vercel proxy sets, or
 `REMOTE_ADDR` as a fallback), plus a global cap of 300 quotes shared across
 all clients. Exceeding either returns HTTP 429 with `{ "errors": [...] }`.
+
+## `GET /wp-json/lilloaves/v1/variations`
+
+Per-variation prices for every WooCommerce **variable** product (Muffins,
+Cookies, Crackers — all sharing the `pa_pack-size` attribute), in one
+request. The Store API's own product list (`GET /wc/store/v1/products`)
+returns each variable product's `attributes[].terms` and `variations[]`
+(id + attribute slug) plus a `prices.price_range` min/max, but **no
+per-variation price** — verified live — and a variation isn't individually
+fetchable either (`?include=<variation_id>` returns empty). Without this
+endpoint there is no way to show "Single Cookie $5.00" next to "Box of 6
+$20.00", or to swap the displayed price when a customer picks one, short of
+one request per product — which is exactly the per-page traffic
+multiplication the Vercel proxy (`api/store.js`, frontend repo) exists to
+collapse into roughly one upstream request per minute.
+
+Modelled on `GET /pickup` below: **public, no `X-LL-Secret` required** (a
+price is already public on the product page, so there's nothing here a
+shared secret would protect), read-only, creates nothing, and returns
+amounts in minor units with the same `currency` object shape as `/quote`
+and `/pickup`, so the client can pass it straight to its existing
+`formatPrice`. No request parameters.
+
+```json
+{
+  "products": {
+    "88": [
+      {
+        "id": 89,
+        "name": "Single Cookie",
+        "slug": "single-cookie",
+        "price": 500,
+        "in_stock": true,
+        "purchasable": true
+      },
+      {
+        "id": 90,
+        "name": "Box of 6",
+        "slug": "box-of-6",
+        "price": 2000,
+        "in_stock": true,
+        "purchasable": true
+      }
+    ]
+  },
+  "currency": {
+    "currency_code": "USD",
+    "currency_symbol": "$",
+    "currency_minor_unit": 2,
+    "currency_decimal_separator": ".",
+    "currency_thousand_separator": ",",
+    "currency_prefix": "$",
+    "currency_suffix": ""
+  }
+}
+```
+
+- `products` is an **object keyed by parent product id** (as a string,
+  e.g. `"88"`, matching the `id` the storefront already uses to identify
+  that product elsewhere) — a lookup, not a list, so the client does
+  `variationsById[product.id]` rather than a linear search. Only variable
+  products with at least one resolvable variation appear as a key; a simple
+  product (bread) is never in this object at all — check for the parent
+  id's presence to decide whether a product has pack sizes.
+- Each entry is every variation WooCommerce has for that parent, **including
+  out-of-stock or currently non-purchasable ones** — same principle as an
+  out-of-stock simple product (Japanese Milk Bread) still appearing on the
+  storefront rather than vanishing. `in_stock`/`purchasable` are what the
+  client renders a pill as disabled from; nothing is filtered out here.
+- `id` is the **variation id** — this is the value a client sends back as
+  `variation_id` to `/quote` and the handoff (see their own docs). `name`
+  and `slug` are the pack-size term's own name/slug (e.g. `"Single Cookie"`
+  / `"single-cookie"`), read from the `pa_pack-size` taxonomy term, not
+  hardcoded — this endpoint takes whichever attribute a variation actually
+  has, so a renamed attribute or a second one added later needs no code
+  change here (see `ll_variation_term()`'s own comment).
+- `price` is that variation's own current price (minor units) — sale price
+  if one is active, same as `WC_Product::get_price()` everywhere else in
+  this plugin.
+
+WordPress.com's edge/CDN caches `GET` responses the same way it does for
+`/pickup` (see that section's own note on this) — harmless here too, since
+a pack-size price does not need per-second freshness, but worth knowing if
+a change in wp-admin seems to "not take effect" immediately.
 
 ## `POST /wp-admin/admin-post.php` (`action=ll_handoff`)
 
@@ -271,7 +391,7 @@ quotes.
 | Field | Value |
 |---|---|
 | `action` | `ll_handoff` |
-| `items` | JSON string, `[{"id":13,"qty":2}]` — ids and quantities only |
+| `items` | JSON string, `[{"id":13,"qty":2},{"id":88,"qty":1,"variation_id":90}]` — ids, quantities and (for a pack size) a variation id only |
 | `fulfilment` | `delivery` or `pickup` |
 | `token` | idempotency token, see above |
 | `coupon` | coupon code, or empty |
@@ -280,8 +400,11 @@ quotes.
 | `pickup_store`, `pickup_date`, `pickup_slot` | pickup only |
 
 Every price-shaped value a client could send is ignored outright — only
-`id`/`qty` are ever read from `items`, and every line is re-priced from
-WooCommerce's own product data, the same as `/quote`. The coupon is
+`id`/`qty`/`variation_id` are ever read from `items`, and every line is
+re-priced from WooCommerce's own product data, the same as `/quote`,
+including the same `ll_validate_variation()` check that a pack size
+genuinely belongs to its stated parent product before it's added — a
+variation id is a selector, never a price. The coupon is
 re-applied with `WC()->cart->apply_coupon()`; fulfilment is re-validated
 with the same `ll_apply_fulfilment()` `/quote` uses, so a `pickup` claim can
 never yield a delivery rate and an out-of-zone postcode can never yield free
