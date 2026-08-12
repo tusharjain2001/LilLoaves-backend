@@ -1757,3 +1757,93 @@ function ll_checkout_css() {
         }
     ';
 }
+
+/* -------------------------------------------------------------------------
+ * Lunch Box slot control — the builder on the storefront (Menu.jsx) picks
+ * its three columns by product tag: lunchbox-bread / lunchbox-cracker /
+ * lunchbox-dessert. Previously the only way to change that was typing one
+ * of those slugs into the Tags box by hand, which the owner won't discover
+ * and can easily typo. This adds a real dropdown to the product editor's
+ * General tab instead — one field, four states (none/Bread/Cracker/Dessert)
+ * — that reads and writes the *same* tags, so the storefront, the Store API
+ * and Menu.jsx need no change at all and nothing has to be migrated.
+ *
+ * woocommerce_product_options_general_product_data fires inside the General
+ * tab panel for every product type, simple or variable alike (confirmed
+ * against this store's WooCommerce 11.0.1 core: it's the last thing rendered
+ * in html-product-data-general.php, which every product type shares) — so
+ * this needs no per-type branching to also show up on the variable
+ * muffins/cookies/crackers, several of which are currently Lunch Box
+ * desserts/crackers.
+ * ---------------------------------------------------------------------- */
+
+const LL_LUNCHBOX_TAGS = [
+    'bread'   => 'lunchbox-bread',
+    'cracker' => 'lunchbox-cracker',
+    'dessert' => 'lunchbox-dessert',
+];
+
+add_action('woocommerce_product_options_general_product_data', 'll_render_lunchbox_field');
+
+function ll_render_lunchbox_field() {
+    if (!ll_wc_ready() || !function_exists('woocommerce_wp_select')) return;
+
+    // $product_object is a true global set by WC_Meta_Box_Product_Data::output()
+    // (`global $thepostid, $product_object;`) before this hook fires — the
+    // same object every other field on this tab reads its current value from.
+    global $product_object;
+    if (!$product_object instanceof WC_Product) return;
+
+    $current = 'none';
+    foreach (LL_LUNCHBOX_TAGS as $slot => $slug) {
+        if (has_term($slug, 'product_tag', $product_object->get_id())) {
+            $current = $slot;
+            break;
+        }
+    }
+
+    echo '<div class="options_group">';
+    woocommerce_wp_select([
+        'id'          => '_ll_lunchbox_slot',
+        'label'       => __('Lunch Box', 'lilloaves'),
+        'value'       => $current,
+        'options'     => [
+            'none'    => __('Not in the Lunch Box', 'lilloaves'),
+            'bread'   => __('Lunch Box — Bread', 'lilloaves'),
+            'cracker' => __('Lunch Box — Cracker', 'lilloaves'),
+            'dessert' => __('Lunch Box — Dessert', 'lilloaves'),
+        ],
+        'desc_tip'    => true,
+        'description' => __('Which Lunch Box column this bake appears in. Customers building a Lunch Box choose one option from each column. Choose "Not in the Lunch Box" to leave it out.', 'lilloaves'),
+    ]);
+    echo '</div>';
+}
+
+/**
+ * woocommerce_process_product_meta (no type suffix) is fired by
+ * WC_Admin_Meta_Boxes::save_meta_boxes() for every product type — unlike
+ * woocommerce_process_product_meta_{type}, which would need registering once
+ * per type to cover both the simple breads and the variable muffins/cookies/
+ * crackers. By the time it fires, save_meta_boxes() has already verified the
+ * woocommerce_meta_nonce, rejected autosaves/revisions, and checked
+ * current_user_can('edit_post') — confirmed directly in WooCommerce core, so
+ * this needs none of those checks itself.
+ */
+add_action('woocommerce_process_product_meta', 'll_save_lunchbox_field');
+
+function ll_save_lunchbox_field($post_id) {
+    if (!ll_wc_ready() || !isset($_POST['_ll_lunchbox_slot'])) return;
+
+    $slot  = sanitize_text_field(wp_unslash($_POST['_ll_lunchbox_slot']));
+    $slugs = array_values(LL_LUNCHBOX_TAGS);
+
+    // Drop whichever lunchbox-* tag(s) are currently set, then add back only
+    // the chosen one. Removing all three first (rather than diffing) also
+    // self-heals a product that somehow ended up tagged with more than one
+    // slot, and "none" naturally becomes "remove, add nothing back".
+    wp_remove_object_terms($post_id, $slugs, 'product_tag');
+
+    if (isset(LL_LUNCHBOX_TAGS[$slot])) {
+        wp_add_object_terms($post_id, LL_LUNCHBOX_TAGS[$slot], 'product_tag');
+    }
+}
