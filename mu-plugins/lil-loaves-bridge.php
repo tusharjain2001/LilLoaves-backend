@@ -1847,3 +1847,83 @@ function ll_save_lunchbox_field($post_id) {
         wp_add_object_terms($post_id, LL_LUNCHBOX_TAGS[$slot], 'product_tag');
     }
 }
+
+/* -------------------------------------------------------------------------
+ * Sampler Box slot control — same idea as the Lunch Box control just above:
+ * a product-editor field, stored as tags, that Menu.jsx-style storefront
+ * code can query with no proxy/Store API change.
+ *
+ * Deliberately NOT a clone of the Lunch Box dropdown's shape, even though
+ * it reuses every other part of that pattern (same hooks, same has_term/
+ * wp_add_object_terms/wp_remove_object_terms tag plumbing). The Lunch Box's
+ * three slots are genuinely exclusive — one bake is either the bread, the
+ * cracker or the dessert column, never two at once — so a single <select>
+ * fits. The Sampler Box's four roles are not: "the customer chooses one
+ * cracker; alongside that chooser sit optional paid add-ons" means the same
+ * two real crackers (Doc's, Chief's — there is no third cracker to invent,
+ * and the brief is explicit that none should be) are legitimately BOTH the
+ * free included choice AND a purchasable extra at the same time. A
+ * mutually-exclusive dropdown cannot express "both" at all; four
+ * independent checkboxes can, and cost the owner nothing extra to learn —
+ * tick every box that applies, leave every box unticked for "not in the
+ * Sampler Box", same as choosing "Not in the Lunch Box" above.
+ * ---------------------------------------------------------------------- */
+
+const LL_SAMPLER_TAGS = [
+    'bread_choice'   => 'sampler-bread-choice',
+    'cracker_choice' => 'sampler-cracker-choice',
+    'bread_addon'    => 'sampler-bread-addon',
+    'cracker_addon'  => 'sampler-cracker-addon',
+];
+
+/** Field id/label/tooltip for each checkbox, in display order. Kept next to
+ *  LL_SAMPLER_TAGS's own ordering so the two never drift apart. */
+function ll_sampler_field_copy() {
+    return [
+        'bread_choice'   => [__('Bread choice', 'lilloaves'), __('One of the free bread choices inside the $50 Sampler Box.', 'lilloaves')],
+        'cracker_choice' => [__('Cracker choice', 'lilloaves'), __('One of the free cracker choices inside the $50 Sampler Box.', 'lilloaves')],
+        'bread_addon'    => [__('Bread add-on', 'lilloaves'), __('An extra bread a customer can add to their Sampler Box, at this price.', 'lilloaves')],
+        'cracker_addon'  => [__('Cracker add-on', 'lilloaves'), __('An extra cracker a customer can add to their Sampler Box, at this price.', 'lilloaves')],
+    ];
+}
+
+add_action('woocommerce_product_options_general_product_data', 'll_render_sampler_field');
+
+function ll_render_sampler_field() {
+    if (!ll_wc_ready() || !function_exists('woocommerce_wp_checkbox')) return;
+
+    global $product_object;
+    if (!$product_object instanceof WC_Product) return;
+
+    echo '<div class="options_group">';
+    foreach (ll_sampler_field_copy() as $slot => $copy) {
+        woocommerce_wp_checkbox([
+            'id'          => '_ll_sampler_' . $slot,
+            'label'       => $slot === 'bread_choice' ? __('Sampler Box', 'lilloaves') . ': ' . $copy[0] : $copy[0],
+            'value'       => has_term(LL_SAMPLER_TAGS[$slot], 'product_tag', $product_object->get_id()) ? 'yes' : 'no',
+            'desc_tip'    => true,
+            'description' => $copy[1],
+        ]);
+    }
+    echo '</div>';
+}
+
+/**
+ * Same trigger and the same "no extra checks needed" reasoning as
+ * ll_save_lunchbox_field() above — see its own comment. Each checkbox is
+ * independent: present in $_POST (checked) adds its tag, absent (unchecked)
+ * removes it, so ticking/unticking one box never disturbs the other three.
+ */
+add_action('woocommerce_process_product_meta', 'll_save_sampler_field');
+
+function ll_save_sampler_field($post_id) {
+    if (!ll_wc_ready()) return;
+
+    foreach (LL_SAMPLER_TAGS as $slot => $slug) {
+        if (isset($_POST['_ll_sampler_' . $slot])) {
+            wp_add_object_terms($post_id, $slug, 'product_tag');
+        } else {
+            wp_remove_object_terms($post_id, $slug, 'product_tag');
+        }
+    }
+}
