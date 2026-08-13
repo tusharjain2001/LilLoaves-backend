@@ -9,7 +9,8 @@
     "start": "node server.js",
     "dev": "LOCAL=1 node --watch server.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "preview:email": "node scripts/preview-email.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",

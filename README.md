@@ -37,6 +37,13 @@ never runs any of the JavaScript here.
   pickup order. See its own section further down.
 - `lib/notify.js` — that route's whole implementation, exported as a plain
   function of the request body so it is testable without an HTTP server.
+- `lib/email-template.js` — the confirmation email markup, built to Figma
+  node 314:243. Tables and inline styles, plus the dark-mode handling
+  described below.
+- `lib/order-number.js` — the `LL-#####` reference printed on both emails.
+- `assets/*.png` — the three transparent decorations the template embeds.
+- `scripts/preview-email.mjs` — renders both emails to `preview/*.html` for
+  eyeballing in a browser. `npm run preview:email`.
 - `lib/money.js` — minor-units → `$21.13`. A deliberate byte-for-byte copy of
   the frontend repo's `src/lib/money.js`; the two repos deploy separately so
   neither can import the other. **Change one, change both.**
@@ -81,10 +88,52 @@ rejected rather than confirmed.
 `items` is the same shape `/quote` documents. `pickup` carries machine
 values — the slot is `start-end`, never the display label.
 
-**Responses:** `200 {ok:true}`; `400` bad contact/items/slot; `403` origin not
-allowlisted; `409` the quote came back with errors; `500` misconfigured;
-`502` WordPress unreachable or SMTP refused. Every failure returns
-`{ok:false, error}` and sends nothing.
+**Responses:** `200 {ok:true, orderNumber}`; `400` bad contact/items/slot;
+`403` origin not allowlisted; `409` the quote came back with errors; `500`
+misconfigured; `502` WordPress unreachable or SMTP refused. Every failure
+returns `{ok:false, error}` and sends nothing.
+
+### The order number
+
+Both emails carry `Order #: LL-#####` — five digits, generated per request in
+`lib/order-number.js`. It is **random, not sequential, and stored nowhere**:
+the pickup flow places no WooCommerce order, so there is no order id to use,
+and this service has no database, so there is no counter. Roughly a
+1-in-90,000 chance of two orders sharing one, which is fine for what it is —
+a reference the customer reads out at the counter alongside their name and
+slot. Nothing looks anything up by it.
+
+**When Place Order eventually creates a real WooCommerce order, use that
+order's number and delete `lib/order-number.js`.**
+
+### Dark mode
+
+iOS Mail, Apple Mail, Gmail and Outlook.com each darken mail differently, and
+by default iOS Mail *invents* its own colour changes for a message that
+hasn't declared it handles dark mode — which is what turns a pale palette like
+this one into grey mush. Three mechanisms are needed together, all in
+`lib/email-template.js`:
+
+1. `<meta name="color-scheme">` and `<meta name="supported-color-schemes">`
+   plus the matching `:root` declarations. This is the opt-out from iOS
+   Mail's automatic mangling — once declared, it renders what it is told.
+2. `@media (prefers-color-scheme: dark)` rules carrying `!important`. Inline
+   styles beat a stylesheet but not an `!important` one, so the light palette
+   stays inline (for clients that drop `<style>`) and dark mode overrides it.
+3. `[data-ogsc]` / `[data-ogsb]` duplicates of those rules — Outlook.com
+   rewrites the DOM instead of honouring the media query.
+
+**Every colour that changes carries both an inline style and a class.** The
+class must sit on the *same element* as the inline colour, never on a wrapper:
+a dark rule on a parent is only inherited, and an inline colour on the child
+beats inheritance — which silently leaves that text dark-on-dark. There is a
+test for exactly this.
+
+The three decorations are **transparent** PNGs sent as `cid:` attachments. A
+baked-in background would be a light rectangle floating in a dark email, and
+`cid:` is the one embedding method Gmail honours (it strips `data:` URIs).
+Nothing that carries meaning is an image — every word is real text, so the
+email reads with images off.
 
 **Origin, not a shared secret.** The caller is a real browser, so its Origin
 header is genuine and not forgeable by a third-party page — checking it means
@@ -97,10 +146,13 @@ route is a spam relay pointed at the bakery's own inbox, so it fails closed.
 ### Deploy
 
 Its own Vercel project, root directory = this repo. Set every variable from
-the "Order notification mail" block of `.env.example`, then point the
-storefront at it by setting `VITE_ORDER_API_URL` in the *frontend's* Vercel
-project — that one is baked in at build time, so **the frontend needs a
-redeploy** after changing it.
+the "Order notification mail" block of `.env.example`.
+
+The storefront reaches it at a **hardcoded** URL —
+`https://lil-loaves-backend.vercel.app/api/notify`, the `ENDPOINT` constant in
+the frontend repo's `src/lib/notify.js`. There is no environment variable for
+it on the frontend side. If this project's domain ever changes, edit that
+constant and redeploy the frontend.
 
 `GMAIL_APP_PASSWORD` is a Google **App Password** (16 characters, from
 myaccount.google.com/apppasswords, requires 2-Step Verification). Google
