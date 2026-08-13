@@ -1,9 +1,18 @@
 # LilLoaves backend
 
-WordPress.com backend for the Lil' Loaves bakery. Holds server-side glue
-between the React storefront and WooCommerce — currently a single
-must-use plugin that prices carts, schedules pickup, and hands checkout to
-WooCommerce.
+Server-side glue between the React storefront and WooCommerce. **Two
+deployables live in this one repo, and they have nothing to do with each
+other at runtime:**
+
+| What | Where it runs | How it deploys |
+|---|---|---|
+| `mu-plugins/lil-loaves-bridge.php` | WordPress.com | `scp` to `wp-content/mu-plugins/` |
+| `server.js` + `lib/` | Its own Vercel project | `git push` |
+
+Adding the Node service changed nothing about the plugin: it is still
+copied up by hand, still loads on every WordPress request, and still rolls
+back by deleting the file. Vercel never touches WordPress and WordPress
+never runs any of the JavaScript here.
 
 ## What's here
 
@@ -22,11 +31,92 @@ WooCommerce.
   `GET /wp-json/lilloaves/v1/variations` read endpoint for pack-size prices,
   and branding for WooCommerce's own confirmation emails — see the matching
   sections below.
+- `server.js` — Express app for the **order-notification service**, deployed
+  to its own Vercel project. One route that matters,
+  `POST /api/notify`, which emails the bakery and the customer a placed
+  pickup order. See its own section further down.
+- `lib/notify.js` — that route's whole implementation, exported as a plain
+  function of the request body so it is testable without an HTTP server.
+- `lib/money.js` — minor-units → `$21.13`. A deliberate byte-for-byte copy of
+  the frontend repo's `src/lib/money.js`; the two repos deploy separately so
+  neither can import the other. **Change one, change both.**
+- `lib/origins.js` — the CORS/Origin allowlist for `/api/notify`.
 - `.env` (gitignored) — WordPress.com site URL, SSH/SFTP access, WooCommerce
-  object IDs. Copy `.env.example` to `.env` and fill in locally; never commit
-  real values.
+  object IDs, and the mail service's own variables. Copy `.env.example` to
+  `.env` and fill in locally; never commit real values.
 
-## Deploy
+## `POST /api/notify` — order notification mail
+
+The storefront's `/pickup` flow ends with Place Order. That posts here, and
+this sends two emails: a confirmation to the customer, and the same order
+plus their contact details to the bakery.
+
+**It creates no WooCommerce order.** The pickup flow does not place one yet,
+so these two emails are currently the *entire* record that an order
+happened — nothing appears in `wp-admin`, no stock moves, no WooCommerce
+confirmation fires. Hooking Place Order to `ll_handoff` is the obvious next
+step.
+
+**The money rule holds here too.** The browser sends product ids and
+quantities only. This service then re-prices the whole basket through
+`POST /wp-json/lilloaves/v1/quote` (with `X-LL-Secret`) before writing a
+single figure into an email, reads product names back from
+`GET /wc/store/v1/products`, pack-size labels from
+`GET /wp-json/lilloaves/v1/variations`, and the store/date/slot wording from
+`GET /wp-json/lilloaves/v1/pickup`. Nothing a browser sent decides what the
+bakery is told they sold, and a collection slot the bakery doesn't offer is
+rejected rather than confirmed.
+
+**Request body:**
+
+```json
+{
+  "items": [{ "id": 13, "qty": 2 }, { "id": 88, "qty": 1, "variation_id": 90 }],
+  "contact": { "name": "Jess", "email": "jess@example.com", "phone": "714-555-0123" },
+  "pickup": { "store": "orange-county-store", "date": "2026-08-09", "slot": "14:00-14:30" },
+  "coupon": ""
+}
+```
+
+`items` is the same shape `/quote` documents. `pickup` carries machine
+values — the slot is `start-end`, never the display label.
+
+**Responses:** `200 {ok:true}`; `400` bad contact/items/slot; `403` origin not
+allowlisted; `409` the quote came back with errors; `500` misconfigured;
+`502` WordPress unreachable or SMTP refused. Every failure returns
+`{ok:false, error}` and sends nothing.
+
+**Origin, not a shared secret.** The caller is a real browser, so its Origin
+header is genuine and not forgeable by a third-party page — checking it means
+something, exactly as it does on the plugin's `ll_handoff`. A request from an
+unlisted origin, or with no Origin at all, gets a `403`. This is deliberately
+the opposite of `/quote`, which is called server-to-server, sends no Origin,
+and uses `X-LL-Secret` instead. **Don't harmonise the two.** An open mail
+route is a spam relay pointed at the bakery's own inbox, so it fails closed.
+
+### Deploy
+
+Its own Vercel project, root directory = this repo. Set every variable from
+the "Order notification mail" block of `.env.example`, then point the
+storefront at it by setting `VITE_ORDER_API_URL` in the *frontend's* Vercel
+project — that one is baked in at build time, so **the frontend needs a
+redeploy** after changing it.
+
+`GMAIL_APP_PASSWORD` is a Google **App Password** (16 characters, from
+myaccount.google.com/apppasswords, requires 2-Step Verification). Google
+rejects ordinary account passwords for SMTP.
+
+```bash
+npm install
+npm test           # 15 tests, no network and no SMTP
+npm run dev        # http://localhost:4100, LOCAL=1 is set for you
+curl localhost:4100/health
+```
+
+`ALLOWED_ORIGINS` must include `http://localhost:5173` for the storefront's
+`npm run dev` to reach a locally-running copy.
+
+## Deploy the plugin
 
 This is a WordPress.com Business/Commerce site — SSH gives WP-CLI, SFTP
 gives file transfer, and both are exposed under the same `lilloaves-wp` host

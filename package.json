@@ -1,0 +1,23 @@
+{
+  "name": "lilloaves-order-mail",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Order notification mail for the Lil' Loaves storefront's pickup flow",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "LOCAL=1 node --watch server.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "nodemailer": "^8.0.5"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.10"
+  }
+}
