@@ -338,6 +338,23 @@ function ll_boot_cart() {
 }
 
 /**
+ * True only while ll_apply_fulfilment() below is running its own two-pass
+ * rate match. ll_filter_checkout_shipping_rates() (further down) must not
+ * apply while this is true: WC()->session's ll_from_handoff/ll_fulfilment
+ * can be *stale*, left over from an earlier, already-completed order in the
+ * same browser session (nothing ever clears them) — without this guard, a
+ * customer who checked out with Delivery once and later opens a fresh
+ * pickup quote in the same browser would have pass one's rate list
+ * pre-filtered down to "flat_rate only" by the *previous* order's fulfilment
+ * before this function's own match-search ever ran, so it would never find
+ * local_pickup and would wrongly report pickup as unavailable.
+ */
+function &ll_rate_filter_suspended() {
+    static $suspended = false;
+    return $suspended;
+}
+
+/**
  * Chooses the shipping method server-side and returns any errors.
  *
  * Two passes, and the order matters. WC_Shipping::get_packages() is a bare
@@ -348,6 +365,34 @@ function ll_boot_cart() {
  * selection.
  */
 function ll_apply_fulfilment($fulfilment, $postcode) {
+    $suspend =& ll_rate_filter_suspended();
+    $suspend = true;
+    try {
+        return ll_apply_fulfilment_inner($fulfilment, $postcode);
+    } finally {
+        // WC_Shipping::calculate_shipping_for_package() caches its rates in
+        // session, keyed by a hash of destination+cart that knows nothing
+        // about our own ll_from_handoff/ll_fulfilment flags — and skips
+        // woocommerce_package_rates entirely on a cache hit (verified by
+        // reading WC_Shipping::calculate_shipping_for_package() in
+        // WooCommerce 11.0.1 core). Every calculate_shipping() call just
+        // above ran with that filter suspended, so whatever got cached for
+        // this exact package is the *unfiltered* rate list. Verified live
+        // (server-side, mirroring the real handoff-then-checkout-page
+        // sequence): without clearing it here, the checkout page's own very
+        // next calculate_shipping() call for the same postcode/cart reads
+        // that stale cache and silently shows both rates again — the
+        // reentrancy guard above stops OUR OWN matching logic from being
+        // fooled by a stale cache, but does nothing about WooCommerce's.
+        // Clearing it forces one fresh, filtered recomputation next time.
+        $suspend = false;
+        foreach (WC()->shipping()->get_packages() as $key => $package) {
+            WC()->session->set('shipping_for_package_' . $key, null);
+        }
+    }
+}
+
+function ll_apply_fulfilment_inner($fulfilment, $postcode) {
     $errors  = [];
     $country = WC()->countries->get_base_country();
 
@@ -392,6 +437,34 @@ function ll_apply_fulfilment($fulfilment, $postcode) {
 
     return $errors;
 }
+
+/**
+ * Bug A — the block checkout page listed Local pickup even after a customer
+ * explicitly chose Delivery on our cart (and vice versa for Pickup vs
+ * flat_rate), letting them silently undo a choice they'd already made, with
+ * a delivery address still attached. local_pickup itself stays registered
+ * on shipping zones 0 and 1 untouched — removing it there is what makes
+ * pickup unreachable (see ll_apply_fulfilment's own zone-matching above);
+ * this only trims what's *offered* on checkout for a session that came
+ * through our handoff (ll_from_handoff). Any other route to checkout keeps
+ * WooCommerce's normal, unfiltered set of rates — that flag is only ever
+ * set inside ll_handoff() below.
+ *
+ * ll_fulfilment is stored explicitly at handoff time rather than inferred
+ * from ll_pickup being null-or-array: null is ambiguous between "this
+ * session chose delivery" and "this session never went through our handoff
+ * at all", and this filter needs to tell those apart with certainty.
+ */
+add_filter('woocommerce_package_rates', function ($rates, $package) {
+    if (ll_rate_filter_suspended()) return $rates; // see that function's own comment
+    if (!WC()->session || !WC()->session->get('ll_from_handoff')) return $rates;
+
+    $wanted = WC()->session->get('ll_fulfilment') === 'pickup' ? 'local_pickup' : 'flat_rate';
+    foreach ($rates as $key => $rate) {
+        if ($rate->get_method_id() !== $wanted) unset($rates[$key]);
+    }
+    return $rates;
+}, 10, 2);
 
 /**
  * The same shape the Store API returns, so the client can pass it straight to
@@ -1237,8 +1310,12 @@ function ll_handoff() {
     // post-payment redirect filter (further down) tell "this order came
     // through us" apart from any order reaching WooCommerce checkout some
     // other way, which must keep WooCommerce's own default behaviour.
+    // ll_fulfilment records which one explicitly (see the
+    // woocommerce_package_rates filter above ll_apply_fulfilment for why
+    // null-or-array on ll_pickup alone isn't a safe enough signal for that).
     WC()->session->set('ll_from_handoff', true);
     WC()->session->set('ll_origin', $origin);
+    WC()->session->set('ll_fulfilment', $fulfilment);
     WC()->session->set('ll_pickup', $fulfilment === 'pickup' ? [
         'store' => $pickup_store_name,
         'date'  => $pickup_date,
